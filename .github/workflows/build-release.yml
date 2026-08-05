@@ -1,4 +1,4 @@
-name: 编译 main.so（多 Python 版本）并发布 Release
+name: 编译 .so（多版本）并发布 Release（自动清理旧版）
 
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: 安装依赖
+      - name: 安装编译依赖
         run: |
           pip install --upgrade pip
           pip install cython setuptools wheel python-minifier
@@ -106,16 +106,29 @@ jobs:
         id: tag
         run: echo "tag=main.so-py${{ matrix.python-version }}-${{ github.run_number }}" >> $GITHUB_OUTPUT
 
-      - name: 删除旧 Release（避免冲突）
+      # ---------- 自动清理同版本旧 Release ----------
+      - name: 删除同一 Python 版本的所有旧 Release 和标签
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          PY_VER: ${{ matrix.python-version }}
+          CURRENT_TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          if gh release view "$TAG" &>/dev/null; then
-            gh release delete "$TAG" --yes
-            git push --delete origin "$TAG" 2>/dev/null || true
-          fi
+          # 获取仓库所有标签
+          all_tags=$(curl -sS -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/tags" | \
+            jq -r '.[].ref' | sed 's|refs/tags/||' | grep "^main\.so-py${PY_VER}-")
+          for tag in $all_tags; do
+            if [ "$tag" != "$CURRENT_TAG" ]; then
+              echo "清理旧 Release: $tag"
+              # 删除 Release
+              gh release delete "$tag" --yes 2>/dev/null || true
+              # 删除标签
+              curl -X DELETE -sS -H "Authorization: token $GH_TOKEN" \
+                "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/$tag" || true
+            fi
+          done
 
+      # ---------- 发布新 Release ----------
       - name: 发布 Release
         uses: softprops/action-gh-release@v2
         with:
