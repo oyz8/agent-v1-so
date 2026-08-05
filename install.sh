@@ -229,9 +229,9 @@ EOF
         fi
     else
         cd "$INSTALL_DIR"
-        python3 run.py 2>&1 &
+        nohup python3 run.py 2>&1 &
         success "已后台运行，PID: $!"
-        (crontab -l 2>/dev/null; echo "@reboot cd ${INSTALL_DIR} && python3 run.py") | crontab -
+        (crontab -l 2>/dev/null; echo "@reboot cd ${INSTALL_DIR} && nohup python3 run.py") | crontab -
         success "已添加 @reboot 自启动任务"
     fi
 }
