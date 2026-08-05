@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
 
 jobs:
+  # ── 1. 准备：清理所有旧 Release/标签，创建 Draft Release ──
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -17,7 +18,7 @@ jobs:
         id: tag
         run: echo "tag=main.so-v${{ github.run_number }}" >> $GITHUB_OUTPUT
 
-      - name: 删除所有旧 Release 和标签
+      - name: 彻底删除所有旧 Release 和标签
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -32,17 +33,6 @@ jobs:
               echo "删除 Release 及标签: $t"
               gh release delete "$t" --yes --cleanup-tag 2>/dev/null || true
             done
-          done
-          echo "清理孤立标签 ..."
-          all_tags=$(curl -sS -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/git/refs/tags" | \
-            jq -r '.[].ref | sub("refs/tags/"; "")')
-          for t in $all_tags; do
-            if ! gh release view "$t" &>/dev/null; then
-              echo "删除孤立标签: $t"
-              curl -X DELETE -sS -H "Authorization: token $GH_TOKEN" \
-                "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/$t" || true
-            fi
           done
           echo "清理完成！"
 
@@ -68,7 +58,7 @@ jobs:
           echo "release_id=$release_id" >> $GITHUB_OUTPUT
           echo "Draft Release 创建成功: ID=$release_id"
 
-  # 多版本并行编译
+  # ── 2. 多版本并行编译 + 直接上传 ──
   build:
     needs: prepare
     strategy:
@@ -155,7 +145,7 @@ jobs:
             "$BASE_URL?name=$FILE"
           echo "上传完成"
 
-  # 发布 Release
+  # ── 3. 发布 Draft Release ──
   publish:
     needs: [prepare, build]
     if: success()
