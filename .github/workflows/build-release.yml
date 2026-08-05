@@ -17,13 +17,12 @@ jobs:
         id: tag
         run: echo "tag=main.so-v${{ github.run_number }}" >> $GITHUB_OUTPUT
 
-      - name: 彻底删除所有旧 Release 和标签
+      - name: 删除所有旧 Release 和标签
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           echo "开始清理历史 Release ..."
-          # 分页获取所有 Release，最多 1000 个
           for page in $(seq 1 20); do
             data=$(curl -sS -H "Authorization: token $GH_TOKEN" \
               "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100&page=$page")
@@ -34,7 +33,6 @@ jobs:
               gh release delete "$t" --yes --cleanup-tag 2>/dev/null || true
             done
           done
-          # 清理任何残留孤立 tag
           echo "清理孤立标签 ..."
           all_tags=$(curl -sS -H "Authorization: token $GH_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/git/refs/tags" | \
@@ -70,6 +68,7 @@ jobs:
           echo "release_id=$release_id" >> $GITHUB_OUTPUT
           echo "Draft Release 创建成功: ID=$release_id"
 
+  # 多版本并行编译
   build:
     needs: prepare
     strategy:
@@ -145,9 +144,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: agent-v1-so
         run: |
-          # 从 prepare 获取 upload_url，并替换模板参数
           UPLOAD_URL="${{ needs.prepare.outputs.upload_url }}"
-          # 去掉 {?name,label} 后缀，改为 ?name=文件名
           BASE_URL="${UPLOAD_URL%\{*}"
           FILE="main-${{ matrix.python-version }}-${{ matrix.arch }}.so"
           echo "上传 $FILE ..."
@@ -158,6 +155,7 @@ jobs:
             "$BASE_URL?name=$FILE"
           echo "上传完成"
 
+  # 发布 Release
   publish:
     needs: [prepare, build]
     if: success()
@@ -168,9 +166,14 @@ jobs:
       - name: 发布 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
         run: |
-          echo "发布 Release ..."
-          gh release edit "${{ needs.prepare.outputs.tag }}" --draft=false
+          echo "发布 Release (ID: $RELEASE_ID) ..."
+          curl -sS -X PATCH \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID" \
+            -d '{"draft":false}'
           echo "发布完成"
 
       - name: 清理历史运行记录
