@@ -1,9 +1,77 @@
-name: 编译 .so（多版本）并发布 Release
+name: 编译 .so（全版本）发布 Release
+
 on:
   workflow_dispatch:
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_draft.outputs.upload_url }}
+      release_id: ${{ steps.create_draft.outputs.release_id }}
+      tag: ${{ steps.tag.outputs.tag }}
+    permissions:
+      contents: write
+    steps:
+      - name: 生成统一标签
+        id: tag
+        run: echo "tag=main.so-v${{ github.run_number }}" >> $GITHUB_OUTPUT
+
+      - name: 彻底删除所有旧 Release 和标签
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          echo "开始清理历史 Release ..."
+          # 分页获取所有 Release，最多 1000 个
+          for page in $(seq 1 20); do
+            data=$(curl -sS -H "Authorization: token $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100&page=$page")
+            tags=$(echo "$data" | jq -r '.[].tag_name')
+            [ -z "$tags" ] && break
+            for t in $tags; do
+              echo "删除 Release 及标签: $t"
+              gh release delete "$t" --yes --cleanup-tag 2>/dev/null || true
+            done
+          done
+          # 清理任何残留孤立 tag
+          echo "清理孤立标签 ..."
+          all_tags=$(curl -sS -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/git/refs/tags" | \
+            jq -r '.[].ref | sub("refs/tags/"; "")')
+          for t in $all_tags; do
+            if ! gh release view "$t" &>/dev/null; then
+              echo "删除孤立标签: $t"
+              curl -X DELETE -sS -H "Authorization: token $GH_TOKEN" \
+                "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/$t" || true
+            fi
+          done
+          echo "清理完成！"
+
+      - name: 创建 Draft Release
+        id: create_draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          response=$(curl -sS -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -d '{
+              "tag_name": "${{ steps.tag.outputs.tag }}",
+              "name": "main.so 全版本合集 | #${{ github.run_number }}",
+              "body": "编译中，请稍候 ...",
+              "draft": true,
+              "prerelease": false
+            }')
+          upload_url=$(echo "$response" | jq -r '.upload_url')
+          release_id=$(echo "$response" | jq -r '.id')
+          echo "upload_url=$upload_url" >> $GITHUB_OUTPUT
+          echo "release_id=$release_id" >> $GITHUB_OUTPUT
+          echo "Draft Release 创建成功: ID=$release_id"
+
   build:
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -18,7 +86,6 @@ jobs:
     timeout-minutes: 25
     permissions:
       actions: write
-
     steps:
       - name: 拉取私有仓库源码
         uses: actions/checkout@v4
@@ -63,90 +130,48 @@ jobs:
           python setup.py build_ext --inplace
           ls main*.so || { echo "未生成 .so"; exit 1; }
 
-      - name: 按架构重命名
+      - name: 重命名（含版本-架构）
         working-directory: agent-v1-so
         run: |
-          mv $(ls main.cpython-*.so | head -1) main-${{ matrix.arch }}.so
-          ls -lh main-${{ matrix.arch }}.so
+          mv $(ls main.cpython-*.so | head -1) main-${{ matrix.python-version }}-${{ matrix.arch }}.so
+          ls -lh main-${{ matrix.python-version }}-${{ matrix.arch }}.so
 
       - name: 验证导入
         working-directory: agent-v1-so
         run: python -c "import main; print('✅ ${{ matrix.python-version }} ${{ matrix.arch }}')"
 
-      - name: 上传 Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: so-${{ matrix.python-version }}-${{ matrix.arch }}
-          path: agent-v1-so/main-${{ matrix.arch }}.so
-          retention-days: 1
-
-  release:
-    needs: build
-    runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
-    permissions:
-      contents: write
-
-    steps:
-      - name: 下载产物
-        uses: actions/download-artifact@v4
-        with:
-          pattern: so-${{ matrix.python-version }}-*
-          path: temp
-
-      - name: 整理文件
-        run: |
-          mkdir dist
-          cp temp/so-${{ matrix.python-version }}-amd64/main-amd64.so dist/
-          cp temp/so-${{ matrix.python-version }}-arm64/main-arm64.so dist/
-
-      - name: 生成标签
-        id: tag
-        run: echo "tag=main.so-py${{ matrix.python-version }}-${{ github.run_number }}" >> $GITHUB_OUTPUT
-
-      - name: 删除同一 Python 版本的所有旧 Release 和标签
+      - name: 直接上传到 Draft Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PY_VER: ${{ matrix.python-version }}
-          CURRENT_TAG: ${{ steps.tag.outputs.tag }}
+        working-directory: agent-v1-so
         run: |
-          # 获取仓库所有标签
-          all_tags=$(curl -sS -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/git/refs/tags" | \
-            jq -r '.[].ref' | sed 's|refs/tags/||' | grep "^main\.so-py${PY_VER}-")
-          for tag in $all_tags; do
-            if [ "$tag" != "$CURRENT_TAG" ]; then
-              echo "清理旧 Release: $tag"
-              # 删除 Release
-              gh release delete "$tag" --yes 2>/dev/null || true
-              # 删除标签
-              curl -X DELETE -sS -H "Authorization: token $GH_TOKEN" \
-                "https://api.github.com/repos/${{ github.repository }}/git/refs/tags/$tag" || true
-            fi
-          done
+          # 从 prepare 获取 upload_url，并替换模板参数
+          UPLOAD_URL="${{ needs.prepare.outputs.upload_url }}"
+          # 去掉 {?name,label} 后缀，改为 ?name=文件名
+          BASE_URL="${UPLOAD_URL%\{*}"
+          FILE="main-${{ matrix.python-version }}-${{ matrix.arch }}.so"
+          echo "上传 $FILE ..."
+          curl -sS -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"$FILE" \
+            "$BASE_URL?name=$FILE"
+          echo "上传完成"
 
+  publish:
+    needs: [prepare, build]
+    if: success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
       - name: 发布 Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: "main.so | Python ${{ matrix.python-version }} | #${{ github.run_number }}"
-          body: |
-            ### 编译信息
-            - Python 版本: ${{ matrix.python-version }}
-            - 架构: amd64, arm64
-            - 入口类: WorkerApp
-
-            ### 使用
-            1. 下载对应架构的 `main-xxx.so`，重命名为 `main.so`。
-            2. 与 `config.yml` 同目录，运行 `python run.py`。
-          files: |
-            dist/main-amd64.so
-            dist/main-arm64.so
-          make_latest: false
-          token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "发布 Release ..."
+          gh release edit "${{ needs.prepare.outputs.tag }}" --draft=false
+          echo "发布完成"
 
       - name: 清理历史运行记录
         if: always()
