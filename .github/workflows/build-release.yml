@@ -16,6 +16,8 @@ jobs:
             runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
+    permissions:
+      actions: write
 
     steps:
       - name: 拉取私有仓库源码
@@ -105,7 +107,6 @@ jobs:
         id: tag
         run: echo "tag=main.so-py${{ matrix.python-version }}-${{ github.run_number }}" >> $GITHUB_OUTPUT
 
-      # ---------- 自动清理同版本旧 Release ----------
       - name: 删除同一 Python 版本的所有旧 Release 和标签
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -127,7 +128,6 @@ jobs:
             fi
           done
 
-      # ---------- 发布新 Release ----------
       - name: 发布 Release
         uses: softprops/action-gh-release@v2
         with:
@@ -147,3 +147,13 @@ jobs:
             dist/main-arm64.so
           make_latest: false
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理历史运行记录
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 0
+          keep_minimum_runs: 3
