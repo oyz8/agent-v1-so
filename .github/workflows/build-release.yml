@@ -1,5 +1,4 @@
-name: 编译 .so（多版本）并发布 Release（自动清理旧版）
-
+name: 编译 .so（多版本）并发布 Release
 on:
   workflow_dispatch:
 
