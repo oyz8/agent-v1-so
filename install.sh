@@ -11,7 +11,6 @@ err() { printf "${red}%s${plain}\n" "$*" >&2; }
 success() { printf "${green}%s${plain}\n" "$*"; }
 info() { printf "${yellow}%s${plain}\n" "$*"; }
 
-# sudo 兼容函数
 sudo() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
@@ -23,7 +22,6 @@ sudo() {
     fi
 }
 
-# 自动安装 python3 及 pip
 install_python3_if_needed() {
     if command -v python3 >/dev/null 2>&1; then
         info "python3 已就绪"
@@ -47,7 +45,6 @@ install_python3_if_needed() {
         exit 1
     fi
 
-    # 确保 pip 可用
     if ! python3 -m pip --version >/dev/null 2>&1; then
         info "安装 pip..."
         if command -v apt-get >/dev/null 2>&1; then
@@ -65,7 +62,6 @@ install_python3_if_needed() {
     success "python3 安装完毕"
 }
 
-# 判断安装目录
 if [ "$(id -u)" -eq 0 ]; then
     INSTALL_DIR="/opt/worker"
     IS_ROOT=1
@@ -118,16 +114,22 @@ detect_env() {
 install_deps() {
     if ! python3 -c "import grpc" 2>/dev/null; then
         info "正在安装 Python 依赖..."
-        python3 -m pip install --upgrade pip
-        python3 -m pip install grpcio protobuf pyyaml psutil requests flask || {
-            err "依赖安装失败"; exit 1
-        }
+        python3 -m pip install --upgrade pip 2>/dev/null || true
+        if python3 -m pip install grpcio protobuf pyyaml psutil requests flask 2>&1 | grep -q "externally-managed"; then
+            info "检测到外部管理环境，使用 --break-system-packages 安装..."
+            python3 -m pip install --break-system-packages grpcio protobuf pyyaml psutil requests flask || {
+                err "依赖安装失败"; exit 1
+            }
+        else
+            if ! python3 -c "import grpc" 2>/dev/null; then
+                err "依赖安装失败"; exit 1
+            fi
+        fi
     else
         info "Python 依赖已就绪"
     fi
 }
 
-# 纯 shell 解析标签名，找到最新构建号
 find_latest_tag() {
     _prefix="main.so-py${PY_VER}-"
     _tags_text=$(curl -sS "https://api.github.com/repos/oyz8/agent-v1-so/tags?per_page=100")
