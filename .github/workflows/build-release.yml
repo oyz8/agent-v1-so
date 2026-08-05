@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ── 1. 准备：清理所有旧 Release/标签，创建 Draft Release ──
+  # ── 1. 准备：清理旧 Release（保留最新非草稿），创建 Draft Release ──
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -12,27 +12,47 @@ jobs:
       release_id: ${{ steps.create_draft.outputs.release_id }}
       tag: ${{ steps.tag.outputs.tag }}
     permissions:
-      contents: write
+      actions: write
+
     steps:
       - name: 生成统一标签
         id: tag
         run: echo "tag=main.so-v${{ github.run_number }}" >> $GITHUB_OUTPUT
 
-      - name: 彻底删除所有旧 Release 和标签
+      - name: 清理历史 Release（保留最近一次已发布版本）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
+          echo "查找最新非草稿 Release ..."
+          # 获取最近 5 个 Release，找到第一个非 draft 的（用于保留）
+          KEEP_ID=$(curl -sS -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=5" | \
+            jq -r '[.[] | select(.draft == false)] | .[0].id')
+          if [ "$KEEP_ID" != "null" ] && [ -n "$KEEP_ID" ]; then
+            echo "保留最新 Release ID: $KEEP_ID"
+          else
+            echo "没有可保留的 Release，将全部清理。"
+            KEEP_ID=""
+          fi
+
           echo "开始清理历史 Release ..."
           for page in $(seq 1 20); do
             data=$(curl -sS -H "Authorization: token $GH_TOKEN" \
               "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100&page=$page")
-            tags=$(echo "$data" | jq -r '.[].tag_name')
-            [ -z "$tags" ] && break
-            for t in $tags; do
-              echo "删除 Release 及标签: $t"
-              gh release delete "$t" --yes --cleanup-tag 2>/dev/null || true
-            done
+            # 提取该页所有 Release 的 id 和 tag_name
+            items=$(echo "$data" | jq -c '.[] | {id: .id, tag_name: .tag_name}')
+            [ -z "$items" ] && break
+            while read -r item; do
+              id=$(echo "$item" | jq -r '.id')
+              tag=$(echo "$item" | jq -r '.tag_name')
+              if [ "$id" = "$KEEP_ID" ]; then
+                echo "跳过保留: $tag (ID: $id)"
+                continue
+              fi
+              echo "删除 Release 及标签: $tag"
+              gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+            done <<< "$items"
           done
           echo "清理完成！"
 
@@ -129,21 +149,26 @@ jobs:
         working-directory: agent-v1-so
         run: python -c "import main; print('✅ ${{ matrix.python-version }} ${{ matrix.arch }}')"
 
-      - name: 直接上传到 Draft Release
+      - name: 直接上传到 Draft Release（严格检查）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         working-directory: agent-v1-so
         run: |
+          set -e
           UPLOAD_URL="${{ needs.prepare.outputs.upload_url }}"
           BASE_URL="${UPLOAD_URL%\{*}"
           FILE="main-${{ matrix.python-version }}-${{ matrix.arch }}.so"
           echo "上传 $FILE ..."
-          curl -sS -X POST \
+          HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
             -H "Authorization: token $GH_TOKEN" \
             -H "Content-Type: application/octet-stream" \
             --data-binary @"$FILE" \
-            "$BASE_URL?name=$FILE"
-          echo "上传完成"
+            "$BASE_URL?name=$FILE")
+          if [ "$HTTP_CODE" != "201" ]; then
+            echo "上传失败，HTTP 状态码: $HTTP_CODE"
+            exit 1
+          fi
+          echo "上传成功 (201)"
 
   # ── 3. 发布 Draft Release ──
   publish:
@@ -153,7 +178,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: 发布 Release
+      - name: 发布 Release（取消草稿状态，使用 API）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
