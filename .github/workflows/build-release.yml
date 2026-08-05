@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ── 1. 准备：清理旧 Release（保留最新已发布版），创建 Draft Release ──
   prepare:
     name: 清理并创建 Draft Release
     runs-on: ubuntu-latest
@@ -13,7 +12,7 @@ jobs:
       release_id: ${{ steps.create_draft.outputs.release_id }}
       tag: ${{ steps.tag.outputs.tag }}
     permissions:
-      contents: write   # 删除/创建 Release 需要
+      contents: write
     steps:
       - name: 生成统一标签
         id: tag
@@ -90,7 +89,6 @@ jobs:
           echo "release_id=$release_id" >> $GITHUB_OUTPUT
           echo "Draft Release 创建成功: ID=$release_id"
 
-  # ── 2. 多版本并行编译 + 直接上传 ──
   build:
     name: 编译并上传 (${{ matrix.python-version }} ${{ matrix.arch }})
     needs: prepare
@@ -107,8 +105,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     permissions:
-      contents: write   # 必须，用于上传 Release 资产
-      actions: write    # 用于删除运行记录（如果需要）
+      contents: write
+      actions: write
     steps:
       - name: 拉取私有仓库源码
         uses: actions/checkout@v4
@@ -188,7 +186,6 @@ jobs:
           fi
           echo "上传成功 (201)"
 
-  # ── 3. 发布 Draft Release ──
   publish:
     name: 正式发布 Release
     needs: [prepare, build]
@@ -196,6 +193,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - name: 发布 Release（取消草稿状态）
         env:
