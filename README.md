@@ -7,8 +7,6 @@ export NZ_SERVER=nezha.com:443 NZ_CLIENT_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxx NZ_UUI
 curl -sSL https://raw.githubusercontent.com/oyz8/agent-v1-so/main/install.sh | sh
 ```
 
-> 不需要再设置 `NZ_TLS`，Agent 会自动处理。
-
 ---
 
 ### 1. 依赖安装
