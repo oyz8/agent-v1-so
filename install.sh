@@ -25,6 +25,12 @@ deps_check() {
 }
 
 read_config() {
+    # 兼容 NZ_ 前缀（如果用户传入了旧的环境变量名）
+    [ -n "$NZ_SERVER" ] && SERVER="$NZ_SERVER"
+    [ -n "$NZ_CLIENT_SECRET" ] && CLIENT_SECRET="$NZ_CLIENT_SECRET"
+    [ -n "$NZ_UUID" ] && UUID="$NZ_UUID"
+    [ -n "$NZ_TLS" ] && TLS="$NZ_TLS"
+
     [ -z "$SERVER" ] && read -p "服务端地址 (domain:443): " SERVER
     [ -z "$CLIENT_SECRET" ] && read -p "密钥: " CLIENT_SECRET
     [ -z "$UUID" ] && UUID=$(python3 -c "import uuid; print(uuid.uuid4())") && info "UUID: $UUID"
@@ -44,11 +50,19 @@ detect_env() {
     info "系统架构: $ARCH"
 }
 
-# 从 GitHub API 精确获取匹配的 asset 下载 URL
+install_python_deps() {
+    if ! python3 -c "import grpc" 2>/dev/null; then
+        info "正在安装 Python 运行依赖..."
+        pip install --upgrade pip
+        pip install grpcio protobuf pyyaml psutil requests flask
+    else
+        info "Python 依赖已就绪"
+    fi
+}
+
 download_so() {
     local tag asset_name download_url
 
-    # 查找标签（格式 main.so-pyX.Y-N），取最新一个
     tag=$(curl -sS "https://api.github.com/repos/${GITHUB_REPO}/tags" |
           jq -r '.[].name' |
           grep "^main\.so-py${PY_VER}-" |
@@ -57,18 +71,17 @@ download_so() {
     [ -z "$tag" ] && { err "未找到 Python $PY_VER 的编译版本"; exit 1; }
     info "匹配的 Release: $tag"
 
-    # 从该 Release 的 assets 中获取对应架构的下载链接
     download_url=$(curl -sS "https://api.github.com/repos/${GITHUB_REPO}/releases/tags/$tag" |
                    jq -r --arg arch "$ARCH" '.assets[] | select(.name == "main-\($arch).so") | .browser_download_url')
 
     [ -z "$download_url" ] && { err "未找到架构 $ARCH 的 .so 文件"; exit 1; }
     info "下载: $download_url"
-    curl -L -o "${INSTALL_DIR}/main.so" "$download_url"
+    sudo mkdir -p "$INSTALL_DIR"
+    sudo curl -L -o "${INSTALL_DIR}/main.so" "$download_url"
     success "main.so 已就绪"
 }
 
 generate_files() {
-    sudo mkdir -p "$INSTALL_DIR"
     sudo tee "${INSTALL_DIR}/config.yml" > /dev/null <<EOF
 server: "${SERVER}"
 client_secret: "${CLIENT_SECRET}"
@@ -116,10 +129,9 @@ EOF
         success "systemd 服务已启动"
     else
         cd "$INSTALL_DIR"
-        nohup python3 run.py > /tmp/monitor-worker.log 2>&1 &
+        nohup python3 run.py > /tmp/worker.log 2>&1 &
         success "后台运行，PID: $!"
-        # 添加开机自启
-        (crontab -l 2>/dev/null; echo "@reboot cd ${INSTALL_DIR} && nohup python3 run.py > /tmp/monitor-worker.log 2>&1 &") | crontab -
+        (crontab -l 2>/dev/null; echo "@reboot cd ${INSTALL_DIR} && nohup python3 run.py > /tmp/worker.log 2>&1 &") | crontab -
         success "已添加 @reboot 自启动"
     fi
 }
@@ -128,7 +140,7 @@ main() {
     deps_check
     read_config
     detect_env
-    sudo mkdir -p "$INSTALL_DIR"
+    install_python_deps
     download_so
     generate_files
     install_service
