@@ -2,8 +2,8 @@ name: 编译 .so（多 Python 版本）并发布 Release
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
+#  push:
+#    branches: [main]
 
 jobs:
   build:
