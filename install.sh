@@ -14,7 +14,7 @@ err() { printf "${red}%s${plain}\n" "$*" >&2; }
 success() { printf "${green}%s${plain}\n" "$*"; }
 info() { printf "${yellow}%s${plain}\n" "$*"; }
 
-# 自动判断安装目录和用户类型
+# 自动判断安装目录
 if [ "$(id -u)" -eq 0 ]; then
     INSTALL_DIR="/opt/worker"
     IS_ROOT=1
@@ -25,19 +25,20 @@ fi
 
 deps_check() {
     _missing=""
-    for dep in curl python3 jq; do
-        if ! command -v "$dep" >/dev/null 2>&1; then
-            _missing="${_missing} $dep"
-        fi
-    done
+    if ! command -v curl >/dev/null 2>&1; then
+        _missing="${_missing} curl"
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        _missing="${_missing} python3"
+    fi
     if [ -n "$_missing" ]; then
         err "缺少依赖:$_missing，请先安装。"
+        info "例如: apt install -y curl python3"
         exit 1
     fi
 }
 
 read_config() {
-    # 兼容 NZ_ 前缀环境变量
     [ -n "$NZ_SERVER" ] && SERVER="$NZ_SERVER"
     [ -n "$NZ_CLIENT_SECRET" ] && CLIENT_SECRET="$NZ_CLIENT_SECRET"
     [ -n "$NZ_UUID" ] && UUID="$NZ_UUID"
@@ -82,22 +83,36 @@ install_deps() {
     fi
 }
 
-download_so() {
-    _tag=$(curl -sS "https://api.github.com/repos/${GITHUB_REPO}/tags" | \
-           jq -r '.[].name' | \
-           grep "^main\.so-py${PY_VER}-" | \
-           sort -t'-' -k3 -nr | head -1)
+# 纯 shell 解析 GitHub tags 列表，找出最新的构建号标签
+find_latest_tag() {
+    _prefix="main.so-py${PY_VER}-"
+    # 拉取 tags 列表（每页最多100个，一般够用）
+    _tags_json=$(curl -sS "https://api.github.com/repos/${GITHUB_REPO}/tags?per_page=100")
+    # 提取所有标签名并过滤前缀，再提取构建号，找最大值
+    _latest_tag=$(echo "$_tags_json" | \
+        grep -o '"name": *"[^"]*"' | \
+        sed 's/"name": *"\([^"]*\)"/\1/' | \
+        grep "^${_prefix}" | \
+        sed "s/^${_prefix}//" | \
+        sort -nr | head -1)
 
+    if [ -n "$_latest_tag" ]; then
+        echo "${_prefix}${_latest_tag}"
+    else
+        echo ""
+    fi
+}
+
+download_so() {
+    _tag=$(find_latest_tag)
     [ -z "$_tag" ] && { err "未找到 Python $PY_VER 的编译版本"; exit 1; }
     info "匹配的 Release: $_tag"
 
-    _dl=$(curl -sS "https://api.github.com/repos/${GITHUB_REPO}/releases/tags/$_tag" | \
-          jq -r --arg arch "$ARCH" '.assets[] | select(.name == "main-\($arch).so") | .browser_download_url')
-
-    [ -z "$_dl" ] && { err "未找到架构 $ARCH 的 .so 文件"; exit 1; }
-    info "下载 $_dl"
+    # 直接拼接下载链接，无需解析 assets
+    _dl_url="https://github.com/${GITHUB_REPO}/releases/download/${_tag}/main-${ARCH}.so"
+    info "下载 $_dl_url"
     mkdir -p "$INSTALL_DIR"
-    curl -L -o "${INSTALL_DIR}/main.so" "$_dl" || { err "下载失败"; exit 1; }
+    curl -L -o "${INSTALL_DIR}/main.so" "$_dl_url" || { err "下载失败"; exit 1; }
     success "main.so 已就绪"
 }
 
@@ -128,7 +143,6 @@ PYEOF
 install_service() {
     if command -v systemctl >/dev/null 2>&1; then
         if [ "$IS_ROOT" -eq 1 ]; then
-            # 系统级服务
             cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
 Description=Monitor Worker Service
@@ -149,7 +163,6 @@ EOF
             systemctl start "$SERVICE_NAME"
             success "系统服务已启动"
         else
-            # 用户级服务
             mkdir -p "${HOME}/.config/systemd/user"
             cat > "${HOME}/.config/systemd/user/${SERVICE_NAME}.service" <<EOF
 [Unit]
@@ -173,7 +186,6 @@ EOF
             info "提示: 如需开机自启，请运行: loginctl enable-linger $(whoami)"
         fi
     else
-        # 无 systemd，使用 nohup + cron
         cd "$INSTALL_DIR"
         nohup python3 run.py > /tmp/worker.log 2>&1 &
         success "已后台运行，PID: $!"
