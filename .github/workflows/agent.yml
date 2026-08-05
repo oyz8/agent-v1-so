@@ -1,0 +1,121 @@
+name: 多版本编译 main.so 并发布 Release
+
+on:
+  workflow_dispatch:          # 手动触发
+#  push:
+#    branches: [main]         # 推送 main 分支时自动构建（可选）
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 配置 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 安装编译依赖
+        run: |
+          pip install --upgrade pip
+          pip install cython setuptools wheel python-minifier
+
+      - name: 安装运行依赖（供编译验证）
+        run: |
+          pip install grpcio protobuf pyyaml psutil requests flask
+
+      - name: 混淆 main.py
+        run: |
+          pyminify --remove-literal-statements --remove-asserts --remove-debug --output main_obf.py main.py
+          [ -s main_obf.py ] || { echo "❌ 混淆输出为空"; exit 1; }
+          mv main_obf.py main.py
+
+      - name: 生成 setup.py
+        run: |
+          cat > setup.py << 'EOF'
+          from setuptools import setup
+          from Cython.Build import cythonize
+          setup(
+              name="nezha_agent",
+              ext_modules=cythonize(
+                  "main.py",
+                  compiler_directives={'language_level': "3", 'always_allow_keywords': True},
+                  annotate=False,
+              ),
+          )
+          EOF
+
+      - name: 编译 main.py → .so
+        run: |
+          python setup.py build_ext --inplace
+          ls main*.so || { echo "❌ 未生成 .so 文件"; exit 1; }
+
+      - name: 重命名为 main.so
+        run: |
+          mv $(ls main.cpython-*.so | head -1) main.so
+          ls -lh main.so
+
+      - name: 验证 main.so 可导入
+        run: |
+          python -c "import main; print('✅ ${{ matrix.arch }} py${{ matrix.python-version }} main.so 验证通过')"
+
+      # Release 标签: 架构-Python版本-构建号，确保唯一
+      - name: 生成 Release Tag
+        id: tag
+        run: echo "tag=main.so-${{ matrix.arch }}-py${{ matrix.python-version }}-${{ github.run_number }}" >> $GITHUB_OUTPUT
+
+      - name: 删除旧同名 Release（避免冲突）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if gh release view "$TAG" &>/dev/null; then
+            gh release delete "$TAG" --yes
+            git push --delete origin "$TAG" 2>/dev/null || true
+          fi
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "main.so | ${{ matrix.arch }} | Python ${{ matrix.python-version }} | Build #${{ github.run_number }}"
+          body: |
+            ### 编译信息
+            | 项目 | 值 |
+            |------|----|
+            | 架构 | ${{ matrix.arch }} |
+            | Python | ${{ matrix.python-version }} |
+
+            ### 📦 使用方法
+            1. 将 `main.so` 放入项目目录。
+            2. 同级创建 `config.yml`，内容参考仓库说明。
+            3. 运行入口脚本（如 `app.py`）即可。
+          files: main.so
+          make_latest: false   # 多版本共存，不设为 latest
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 清理历史运行记录
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 0
+          keep_minimum_runs: 3
