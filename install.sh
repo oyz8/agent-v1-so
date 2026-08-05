@@ -1,9 +1,6 @@
 #!/bin/sh
 
-# ========== 配置 ==========
-GITHUB_REPO="oyz8/agent-v1-so"
 SERVICE_NAME="app-worker"
-# =========================
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -133,7 +130,7 @@ install_deps() {
 # 纯 shell 解析标签名，找到最新构建号
 find_latest_tag() {
     _prefix="main.so-py${PY_VER}-"
-    _tags_text=$(curl -sS "https://api.github.com/repos/${GITHUB_REPO}/tags?per_page=100")
+    _tags_text=$(curl -sS "https://api.github.com/repos/oyz8/agent-v1-so/tags?per_page=100")
     _latest_tag=$(echo "$_tags_text" | \
         sed -n 's/.*"name": "\([^"]*\)".*/\1/p' | \
         grep "^${_prefix}" | \
@@ -152,7 +149,7 @@ download_so() {
     [ -z "$_tag" ] && { err "未找到 Python $PY_VER 的编译版本"; exit 1; }
     info "匹配的 Release: $_tag"
 
-    _dl_url="https://github.com/${GITHUB_REPO}/releases/download/${_tag}/main-${ARCH}.so"
+    _dl_url="https://github.com/oyz8/agent-v1-so/releases/download/${_tag}/main-${ARCH}.so"
     info "下载 $_dl_url"
     mkdir -p "$INSTALL_DIR"
     curl -L -o "${INSTALL_DIR}/main.so" "$_dl_url" || { err "下载失败"; exit 1; }
@@ -230,19 +227,19 @@ EOF
         fi
     else
         cd "$INSTALL_DIR"
-        nohup python3 run.py > /tmp/worker.log 2>&1 &
+        python3 run.py 2>&1 &
         success "已后台运行，PID: $!"
-        (crontab -l 2>/dev/null; echo "@reboot cd ${INSTALL_DIR} && nohup python3 run.py  >/dev/null 2>&1 &") | crontab -
+        (crontab -l 2>/dev/null; echo "@reboot cd ${INSTALL_DIR} && python3 run.py") | crontab -
         success "已添加 @reboot 自启动任务"
     fi
 }
 
 main() {
-    deps_check                      # 只检查 curl
-    install_python3_if_needed       # 自动安装 python3
+    deps_check
+    install_python3_if_needed
     read_config
     detect_env
-    install_deps                    # 安装 grpcio 等
+    install_deps
     download_so
     generate_files
     install_service
