@@ -7,9 +7,9 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
-err() { printf "${red}%s${plain}\n" "$*" >&2; }
-success() { printf "${green}%s${plain}\n" "$*"; }
-info() { printf "${yellow}%s${plain}\n" "$*"; }
+err()     { printf "${red}%s${plain}\n"    "$*" >&2; }
+success() { printf "${green}%s${plain}\n"  "$*"; }
+info()    { printf "${yellow}%s${plain}\n" "$*"; }
 
 sudo() {
     if [ "$(id -u)" -eq 0 ]; then
@@ -78,9 +78,9 @@ deps_check() {
 }
 
 read_config() {
-    [ -n "$NZ_SERVER" ] && SERVER="$NZ_SERVER"
+    [ -n "$NZ_SERVER" ]        && SERVER="$NZ_SERVER"
     [ -n "$NZ_CLIENT_SECRET" ] && CLIENT_SECRET="$NZ_CLIENT_SECRET"
-    [ -n "$NZ_UUID" ] && UUID="$NZ_UUID"
+    [ -n "$NZ_UUID" ]          && UUID="$NZ_UUID"
 
     if [ -z "$SERVER" ]; then
         printf "服务端地址 (domain:443): "
@@ -102,15 +102,14 @@ detect_env() {
     PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
     info "Python 版本: $PY_VER"
     case $(uname -m) in
-        x86_64|amd64) ARCH="amd64" ;;
-        aarch64|arm64) ARCH="arm64" ;;
+        x86_64|amd64)   ARCH="amd64" ;;
+        aarch64|arm64)  ARCH="arm64" ;;
         *) err "不支持的架构: $(uname -m)"; exit 1 ;;
     esac
     info "系统架构: $ARCH"
 }
 
 install_deps() {
-    # 检查核心依赖是否已安装
     if python3 -c "import grpc; import grpc_tools; import aiohttp" 2>/dev/null; then
         info "Python 依赖已就绪"
         return
@@ -136,28 +135,20 @@ install_deps() {
     success "Python 依赖安装完成"
 }
 
-find_latest_tag() {
-    _prefix="main.so-py${PY_VER}-"
-    _tags_text=$(curl -sS "https://api.github.com/repos/oyz8/agent-v1-so/tags?per_page=100")
-    _latest_tag=$(echo "$_tags_text" | \
-        sed -n 's/.*"name": "\([^"]*\)".*/\1/p' | \
-        grep "^${_prefix}" | \
-        sed "s/^${_prefix}//" | \
-        sort -nr | head -1)
-
-    if [ -n "$_latest_tag" ]; then
-        echo "${_prefix}${_latest_tag}"
-    else
-        echo ""
-    fi
+find_latest_release_tag() {
+    curl -sS "https://api.github.com/repos/oyz8/agent-v1-so/releases/latest" \
+        | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' \
+        | head -1
 }
 
 download_so() {
-    _tag=$(find_latest_tag)
-    [ -z "$_tag" ] && { err "未找到 Python $PY_VER 的编译版本"; exit 1; }
-    info "匹配的 Release: $_tag"
+    _tag=$(find_latest_release_tag)
+    [ -z "$_tag" ] && { err "未找到最新 Release"; exit 1; }
+    info "最新 Release: $_tag"
 
-    _dl_url="https://github.com/oyz8/agent-v1-so/releases/download/${_tag}/main-${ARCH}.so"
+    # 新 asset 文件名格式: main-{py_ver}-{arch}.so
+    _asset_name="main-${PY_VER}-${ARCH}.so"
+    _dl_url="https://github.com/oyz8/agent-v1-so/releases/download/${_tag}/${_asset_name}"
     info "下载 $_dl_url"
     mkdir -p "$INSTALL_DIR"
     curl -L -o "${INSTALL_DIR}/main.so" "$_dl_url" || { err "下载失败"; exit 1; }
