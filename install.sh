@@ -1,9 +1,6 @@
 #!/bin/sh
 
-# ========== 配置 ==========
-GITHUB_REPO="oyz8/agent-v1-so"
 SERVICE_NAME="app-worker"
-# =========================
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -14,7 +11,7 @@ err() { printf "${red}%s${plain}\n" "$*" >&2; }
 success() { printf "${green}%s${plain}\n" "$*"; }
 info() { printf "${yellow}%s${plain}\n" "$*"; }
 
-# 自动判断安装目录
+# 自动判断安装目录和用户类型
 if [ "$(id -u)" -eq 0 ]; then
     INSTALL_DIR="/opt/worker"
     IS_ROOT=1
@@ -83,15 +80,12 @@ install_deps() {
     fi
 }
 
-# 纯 shell 解析 GitHub tags 列表，找出最新的构建号标签
+# 纯 shell 解析标签名，找到指定 Python 版本的最新构建号
 find_latest_tag() {
     _prefix="main.so-py${PY_VER}-"
-    # 拉取 tags 列表（每页最多100个，一般够用）
-    _tags_json=$(curl -sS "https://api.github.com/repos/${GITHUB_REPO}/tags?per_page=100")
-    # 提取所有标签名并过滤前缀，再提取构建号，找最大值
-    _latest_tag=$(echo "$_tags_json" | \
-        grep -o '"name": *"[^"]*"' | \
-        sed 's/"name": *"\([^"]*\)"/\1/' | \
+    _tags_text=$(curl -sS "https://api.github.com/repos/oyz8/agent-v1-so/tags?per_page=100")
+    _latest_tag=$(echo "$_tags_text" | \
+        sed -n 's/.*"name": "\([^"]*\)".*/\1/p' | \
         grep "^${_prefix}" | \
         sed "s/^${_prefix}//" | \
         sort -nr | head -1)
@@ -108,8 +102,7 @@ download_so() {
     [ -z "$_tag" ] && { err "未找到 Python $PY_VER 的编译版本"; exit 1; }
     info "匹配的 Release: $_tag"
 
-    # 直接拼接下载链接，无需解析 assets
-    _dl_url="https://github.com/${GITHUB_REPO}/releases/download/${_tag}/main-${ARCH}.so"
+    _dl_url="https://github.com/oyz8/agent-v1-so/releases/download/${_tag}/main-${ARCH}.so"
     info "下载 $_dl_url"
     mkdir -p "$INSTALL_DIR"
     curl -L -o "${INSTALL_DIR}/main.so" "$_dl_url" || { err "下载失败"; exit 1; }
