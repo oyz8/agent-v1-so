@@ -112,22 +112,30 @@ detect_env() {
 }
 
 install_deps() {
-    if ! python3 -c "import grpc" 2>/dev/null; then
-        info "正在安装 Python 依赖..."
-        python3 -m pip install --upgrade pip 2>/dev/null || true
-        if python3 -m pip install grpcio protobuf pyyaml psutil requests flask 2>&1 | grep -q "externally-managed"; then
-            info "检测到外部管理环境，使用 --break-system-packages 安装..."
-            python3 -m pip install --break-system-packages grpcio protobuf pyyaml psutil requests flask || {
+    # 检查核心依赖是否已安装
+    if python3 -c "import grpc; import grpc_tools; import aiohttp" 2>/dev/null; then
+        info "Python 依赖已就绪"
+        return
+    fi
+
+    info "正在安装 Python 依赖..."
+    python3 -m pip install --upgrade pip 2>/dev/null || true
+
+    _pkg="grpcio grpcio-tools protobuf pyyaml psutil aiohttp"
+
+    if python3 -m pip install $_pkg 2>&1 | grep -q "externally-managed"; then
+        info "检测到外部管理环境，使用 --break-system-packages 安装..."
+        python3 -m pip install --break-system-packages $_pkg || {
+            err "依赖安装失败"; exit 1
+        }
+    else
+        if ! python3 -c "import grpc; import grpc_tools; import aiohttp" 2>/dev/null; then
+            python3 -m pip install --break-system-packages $_pkg || {
                 err "依赖安装失败"; exit 1
             }
-        else
-            if ! python3 -c "import grpc" 2>/dev/null; then
-                err "依赖安装失败"; exit 1
-            fi
         fi
-    else
-        info "Python 依赖已就绪"
     fi
+    success "Python 依赖安装完成"
 }
 
 find_latest_tag() {
