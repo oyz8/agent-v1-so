@@ -1,9 +1,7 @@
-name: 编译 .so（多 Python 版本）并发布 Release
+name: 编译 main.so（多 Python 版本）并发布 Release
 
 on:
   workflow_dispatch:
-#  push:
-#    branches: [main]
 
 jobs:
   build:
@@ -39,14 +37,14 @@ jobs:
           pip install cython setuptools wheel python-minifier
           pip install grpcio protobuf pyyaml psutil requests flask aiohttp
 
-      - name: 混淆 worker_core.py
+      - name: 混淆 main.py
         working-directory: agent-v1-so
         run: |
-          pyminify --remove-literal-statements --remove-asserts --remove-debug --output worker_core_obf.py worker_core.py
-          [ -s worker_core_obf.py ] || { echo "混淆失败"; exit 1; }
-          mv worker_core_obf.py worker_core.py
+          pyminify --remove-literal-statements --remove-asserts --remove-debug --output main_obf.py main.py
+          [ -s main_obf.py ] || { echo "混淆失败"; exit 1; }
+          mv main_obf.py main.py
 
-      - name: 编译为 .so（产物重命名为 main）
+      - name: 编译为 .so
         working-directory: agent-v1-so
         run: |
           cat > setup.py << 'EOF'
@@ -55,19 +53,19 @@ jobs:
           setup(
               name="monitor_worker",
               ext_modules=cythonize(
-                  "worker_core.py",
+                  "main.py",
                   compiler_directives={'language_level': "3", 'always_allow_keywords': True},
                   annotate=False,
               ),
           )
           EOF
           python setup.py build_ext --inplace
-          ls worker_core*.so || { echo "未生成 .so"; exit 1; }
+          ls main*.so || { echo "未生成 .so"; exit 1; }
 
-      - name: 按架构重命名（保持 main- 前缀以兼容安装脚本）
+      - name: 按架构重命名
         working-directory: agent-v1-so
         run: |
-          mv $(ls worker_core.cpython-*.so | head -1) main-${{ matrix.arch }}.so
+          mv $(ls main.cpython-*.so | head -1) main-${{ matrix.arch }}.so
           ls -lh main-${{ matrix.arch }}.so
 
       - name: 验证导入
@@ -127,7 +125,7 @@ jobs:
             ### 编译信息
             - Python 版本: ${{ matrix.python-version }}
             - 架构: amd64, arm64
-            - 模块: worker_core (入口类: WorkerApp)
+            - 入口类: WorkerApp
 
             ### 使用
             1. 下载对应架构的 `main-xxx.so`，重命名为 `main.so`。
