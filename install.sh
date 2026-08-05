@@ -81,7 +81,6 @@ read_config() {
     [ -n "$NZ_SERVER" ] && SERVER="$NZ_SERVER"
     [ -n "$NZ_CLIENT_SECRET" ] && CLIENT_SECRET="$NZ_CLIENT_SECRET"
     [ -n "$NZ_UUID" ] && UUID="$NZ_UUID"
-    [ -n "$NZ_TLS" ] && TLS="$NZ_TLS"
 
     if [ -z "$SERVER" ]; then
         printf "服务端地址 (domain:443): "
@@ -95,7 +94,6 @@ read_config() {
         UUID=$(python3 -c "import uuid; print(uuid.uuid4())")
         info "自动生成 UUID: $UUID"
     fi
-    TLS=${TLS:-true}
     REPORT_DELAY=${REPORT_DELAY:-4}
     SILENT=${SILENT:-true}
 }
@@ -171,7 +169,6 @@ generate_files() {
 server: "${SERVER}"
 client_secret: "${CLIENT_SECRET}"
 uuid: "${UUID}"
-tls: ${TLS}
 report_delay: ${REPORT_DELAY}
 silent: ${SILENT}
 EOF
