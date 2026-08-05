@@ -13,7 +13,6 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
     permissions:
       actions: write
-
     steps:
       - name: 生成统一标签
         id: tag
@@ -25,7 +24,6 @@ jobs:
         run: |
           set -e
           echo "查找最新非草稿 Release ..."
-          # 获取最近 5 个 Release，找到第一个非 draft 的（用于保留）
           KEEP_ID=$(curl -sS -H "Authorization: token $GH_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/releases?per_page=5" | \
             jq -r '[.[] | select(.draft == false)] | .[0].id')
@@ -40,8 +38,7 @@ jobs:
           for page in $(seq 1 20); do
             data=$(curl -sS -H "Authorization: token $GH_TOKEN" \
               "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100&page=$page")
-            # 提取该页所有 Release 的 id 和 tag_name
-            items=$(echo "$data" | jq -c '.[] | {id: .id, tag_name: .tag_name}')
+            items=$(echo "$data" | jq -c '.[] | {id: .id, tag_name: .tag_name}' 2>/dev/null)
             [ -z "$items" ] && break
             while read -r item; do
               id=$(echo "$item" | jq -r '.id')
@@ -56,12 +53,13 @@ jobs:
           done
           echo "清理完成！"
 
-      - name: 创建 Draft Release
+      - name: 创建 Draft Release（严格检查）
         id: create_draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          response=$(curl -sS -X POST \
+          echo "向 GitHub API 创建 Draft Release ..."
+          response=$(curl -sS -w "\n%{http_code}" -X POST \
             -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${{ github.repository }}/releases" \
@@ -72,8 +70,21 @@ jobs:
               "draft": true,
               "prerelease": false
             }')
-          upload_url=$(echo "$response" | jq -r '.upload_url')
-          release_id=$(echo "$response" | jq -r '.id')
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          echo "HTTP 状态码: $http_code"
+          if [ "$http_code" != "201" ]; then
+            echo "创建失败，响应内容："
+            echo "$body"
+            exit 1
+          fi
+          upload_url=$(echo "$body" | jq -r '.upload_url')
+          release_id=$(echo "$body" | jq -r '.id')
+          if [ "$upload_url" = "null" ] || [ -z "$upload_url" ]; then
+            echo "错误：未从响应中提取到有效的 upload_url"
+            echo "响应原文：$body"
+            exit 1
+          fi
           echo "upload_url=$upload_url" >> $GITHUB_OUTPUT
           echo "release_id=$release_id" >> $GITHUB_OUTPUT
           echo "Draft Release 创建成功: ID=$release_id"
@@ -156,6 +167,10 @@ jobs:
         run: |
           set -e
           UPLOAD_URL="${{ needs.prepare.outputs.upload_url }}"
+          if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
+            echo "错误：从 prepare 作业获取的 upload_url 无效: '$UPLOAD_URL'"
+            exit 1
+          fi
           BASE_URL="${UPLOAD_URL%\{*}"
           FILE="main-${{ matrix.python-version }}-${{ matrix.arch }}.so"
           echo "上传 $FILE ..."
@@ -178,7 +193,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: 发布 Release（取消草稿状态，使用 API）
+      - name: 发布 Release（取消草稿状态）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
