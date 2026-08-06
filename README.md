@@ -12,7 +12,7 @@ curl -sSL https://raw.githubusercontent.com/oyz8/agent-v1-so/main/install.sh | s
 ### 1. 依赖安装
 
 运行时需要的 Python 库（`install.sh` 会自动安装）：
-
+pip install grpcio grpcio-tools protobuf pyyaml psutil aiohttp
 `requirements.txt`
 ```txt
 grpcio
