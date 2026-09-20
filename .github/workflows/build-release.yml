@@ -23,41 +23,29 @@ jobs:
         run: |
           TAG="main.so-v${{ github.run_number }}"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "生成标签: ${TAG}"
 
-      - name: 清理历史 Release（保留最新一条已发布版本）
+      - name: 清理历史 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           REPO="${{ github.repository }}"
 
-          echo "▶ 查找最新已发布 Release ..."
           KEEP_ID=$(gh api "repos/${REPO}/releases?per_page=10" \
             --jq '[.[] | select(.draft == false)] | .[0].id // empty')
-
-          if [[ -n "${KEEP_ID}" ]]; then
-            echo "  保留 Release ID: ${KEEP_ID}"
-          else
-            echo "  无已发布 Release，全部清理"
-          fi
+          [[ -n "${KEEP_ID}" ]] && echo "保留 ID: ${KEEP_ID}" || echo "无已发布版本"
 
           PAGE=1
           while true; do
             ITEMS=$(gh api "repos/${REPO}/releases?per_page=100&page=${PAGE}" \
               --jq '.[] | "\(.id) \(.tag_name)"' 2>/dev/null || true)
             [[ -z "${ITEMS}" ]] && break
-
             while IFS=" " read -r ID TAG_NAME; do
-              if [[ "${ID}" == "${KEEP_ID}" ]]; then
-                echo "  跳过保留: ${TAG_NAME} (${ID})"
-                continue
-              fi
-              echo "  删除: ${TAG_NAME} (${ID})"
+              [[ "${ID}" == "${KEEP_ID}" ]] && { echo "跳过: ${TAG_NAME}"; continue; }
+              echo "删除: ${TAG_NAME}"
               gh release delete "${TAG_NAME}" \
                 --repo "${REPO}" --yes --cleanup-tag 2>/dev/null || true
             done <<< "${ITEMS}"
-
             (( PAGE++ ))
           done
           echo "✅ 清理完成"
@@ -70,34 +58,25 @@ jobs:
           set -euo pipefail
           REPO="${{ github.repository }}"
           TAG="${{ steps.meta.outputs.tag }}"
-          RUN_NUMBER="${{ github.run_number }}"
-          ACTOR="${{ github.actor }}"
-          SHA="${{ github.sha }}"
 
           PAYLOAD=$(jq -n \
             --arg tag  "${TAG}" \
-            --arg name "main.so 全版本合集 | #${RUN_NUMBER}" \
-            --arg body "## main.so 全版本合集\n\n本 Release 由 GitHub Actions 自动编译，包含 **glibc** 与 **musl** 两套原生扩展。\n\n### 文件命名规则\n\n\`\`\`\nmain-{python}-{arch}.so       # glibc（VPS / Debian / Ubuntu）\nmain-{python}-{arch}-musl.so  # musl（Alpine / Unikraft Cloud）\n\`\`\`\n\n### 提交信息\n\n- Commit: \`${SHA}\`\n- 触发者: @${ACTOR}\n- 运行编号: #${RUN_NUMBER}" \
-            '{tag_name:$tag, name:$name, body:$body, draft:true, prerelease:false}')
+            --arg name "main.so 全版本合集 | #${{ github.run_number }}" \
+            --arg body "## main.so 全版本合集\n\n- Commit: \`${{ github.sha }}\`\n- 触发者: @${{ github.actor }}\n- 运行编号: #${{ github.run_number }}" \
+            '{tag_name:$tag,name:$name,body:$body,draft:true,prerelease:false}')
 
-          RESPONSE=$(gh api \
-            --method POST \
+          RESPONSE=$(gh api --method POST \
             --header "Accept: application/vnd.github.v3+json" \
-            "repos/${REPO}/releases" \
-            --input - <<< "${PAYLOAD}")
+            "repos/${REPO}/releases" --input - <<< "${PAYLOAD}")
 
           UPLOAD_URL=$(echo "${RESPONSE}" | jq -r '.upload_url')
           RELEASE_ID=$(echo "${RESPONSE}" | jq -r '.id')
-
-          if [[ -z "${UPLOAD_URL}" || "${UPLOAD_URL}" == "null" ]]; then
-            echo "❌ 未获取到有效 upload_url"
-            echo "${RESPONSE}"
-            exit 1
-          fi
+          [[ -z "${UPLOAD_URL}" || "${UPLOAD_URL}" == "null" ]] \
+            && { echo "${RESPONSE}"; exit 1; }
 
           echo "upload_url=${UPLOAD_URL}" >> "$GITHUB_OUTPUT"
           echo "release_id=${RELEASE_ID}" >> "$GITHUB_OUTPUT"
-          echo "✅ Draft Release 创建成功 ID=${RELEASE_ID}"
+          echo "✅ Draft Release ID=${RELEASE_ID}"
 
 # JOB 2 · build（glibc）
   build:
@@ -105,33 +84,27 @@ jobs:
     needs: prepare
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
-
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
         arch:           [amd64, arm64]
         include:
-          - arch: amd64
-            runner: ubuntu-22.04
-          - arch: arm64
-            runner: ubuntu-22.04-arm
+          - { arch: amd64, runner: ubuntu-22.04 }
+          - { arch: arm64, runner: ubuntu-22.04-arm }
 
     steps:
-      - name: 拉取源码
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/scripts
-          token:      ${{ secrets.REPO_TOKEN }}
-          path:       src
+          token: ${{ secrets.REPO_TOKEN }}
+          path: src
 
-      - name: 配置 Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: 缓存 pip
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: ~/.cache/pip
           key: pip-glibc-${{ matrix.python-version }}-${{ matrix.arch }}
@@ -143,41 +116,27 @@ jobs:
           pip install cython setuptools wheel python-minifier \
                       grpcio protobuf pyyaml psutil requests flask aiohttp
 
-      - name: 混淆 main.py
+      - name: 混淆 & 编译
         working-directory: src/agent-v1-so
         run: |
-          pyminify \
-            --remove-literal-statements \
-            --remove-asserts \
-            --remove-debug \
-            --output main_obf.py \
-            main.py
-          [[ -s main_obf.py ]] || { echo "❌ 混淆产物为空"; exit 1; }
+          pyminify --remove-literal-statements --remove-asserts --remove-debug \
+            --output main_obf.py main.py
+          [[ -s main_obf.py ]] || { echo "❌ 混淆失败"; exit 1; }
           mv main_obf.py main.py
-          echo "✅ 混淆完成"
 
-      - name: 编译 .so
-        working-directory: src/agent-v1-so
-        run: |
           cat > setup.py << 'EOF'
           from setuptools import setup
           from Cython.Build import cythonize
-          setup(
-              name="monitor_worker",
-              ext_modules=cythonize(
-                  "main.py",
-                  compiler_directives={
-                      "language_level": "3",
-                      "always_allow_keywords": True,
-                  },
-                  annotate=False,
-              ),
-          )
+          setup(name="monitor_worker", ext_modules=cythonize(
+              "main.py",
+              compiler_directives={"language_level":"3","always_allow_keywords":True},
+              annotate=False,
+          ))
           EOF
           python setup.py build_ext --inplace
-          ls main*.so || { echo "❌ 未找到生成的 .so"; exit 1; }
+          ls main*.so || { echo "❌ 未找到 .so"; exit 1; }
 
-      - name: 重命名并收集产物
+      - name: 重命名 & 验证
         id: artifact
         working-directory: src/agent-v1-so
         run: |
@@ -186,12 +145,7 @@ jobs:
           mv "${SRC}" "${DEST}"
           cp "${DEST}" "${{ github.workspace }}/artifact.so"
           echo "filename=${DEST}" >> "$GITHUB_OUTPUT"
-          ls -lh "${DEST}"
-
-      - name: 验证导入
-        working-directory: src/agent-v1-so
-        run: |
-          python -c "import main; print('✅ glibc ${{ matrix.python-version }} ${{ matrix.arch }} 导入成功')"
+          python -c "import main; print('✅ glibc ${{ matrix.python-version }} ${{ matrix.arch }}')"
 
       - name: 上传到 Draft Release
         env:
@@ -200,176 +154,138 @@ jobs:
           FILENAME:   ${{ steps.artifact.outputs.filename }}
         run: |
           set -euo pipefail
-
-          if [[ -z "${UPLOAD_URL}" || "${UPLOAD_URL}" == "null" ]]; then
-            echo "❌ upload_url 无效"
-            exit 1
-          fi
-
           FILE="${{ github.workspace }}/artifact.so"
-          if [[ ! -s "${FILE}" ]]; then
-            echo "❌ 产物文件不存在或为空"
-            exit 1
-          fi
-
-          ls -lh "${FILE}"
+          [[ -s "${FILE}" ]] || { echo "❌ 产物为空"; exit 1; }
           BASE_URL="${UPLOAD_URL%\{*}"
-
-          RESPONSE=$(curl -sS -w "\n%{http_code}" \
-            -X POST \
+          RESPONSE=$(curl -sS -w "\n%{http_code}" -X POST \
             -H "Authorization: token ${GH_TOKEN}" \
             -H "Content-Type: application/octet-stream" \
-            --data-binary @"${FILE}" \
-            "${BASE_URL}?name=${FILENAME}")
-
+            --data-binary @"${FILE}" "${BASE_URL}?name=${FILENAME}")
           HTTP_CODE=$(echo "${RESPONSE}" | tail -n1)
           BODY=$(echo "${RESPONSE}" | sed '$d')
-          echo "HTTP 状态码: ${HTTP_CODE}"
-
+          echo "HTTP: ${HTTP_CODE}"
           if [[ "${HTTP_CODE}" != "201" ]]; then
-            echo "❌ 上传失败，响应: ${BODY}"
+            echo "❌ 上传失败: ${BODY}"
             gh release delete "${{ needs.prepare.outputs.tag }}" \
-              --repo "${{ github.repository }}" \
-              --yes --cleanup-tag 2>/dev/null || true
-            echo "✅ 草稿已删除"
+              --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
             exit 1
           fi
-          echo "✅ 上传成功 (201)"
+          echo "✅ 上传成功"
 
 # JOB 3 · build-musl（Alpine 容器）
   build-musl:
     name: musl · py${{ matrix.python-version }} · ${{ matrix.arch }}
     needs: prepare
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
         arch:           [amd64, arm64]
         include:
-          - arch: amd64
-            runner: ubuntu-22.04
-          - arch: arm64
-            runner: ubuntu-22.04-arm
+          - { arch: amd64, runner: ubuntu-22.04 }
+          - { arch: arm64, runner: ubuntu-22.04-arm }
+        exclude:
+          # grpcio 在 arm64+musl+py3.8 无预编译 wheel，源码编译耗时过长
+          - { python-version: "3.8", arch: arm64 }
 
     steps:
-      - name: 拉取源码
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/scripts
-          token:      ${{ secrets.REPO_TOKEN }}
-          path:       src
+          token: ${{ secrets.REPO_TOKEN }}
+          path: src
 
-      - name: 准备容器内脚本
+      - name: 准备脚本
         run: |
-          mkdir -p "${{ github.workspace }}/scripts"
-          mkdir -p "${{ github.workspace }}/output"
+          mkdir -p "${{ github.workspace }}/scripts" \
+                   "${{ github.workspace }}/output"
 
           cat > "${{ github.workspace }}/scripts/build_musl.sh" << 'SCRIPT'
           #!/bin/sh
           set -ex
 
-          echo "===== Python 信息 ====="
+          echo "=== Python 版本 ==="
           python --version
-          which python
-          python -c "import sysconfig; print(sysconfig.get_path('include'))"
 
-          echo "===== 安装系统工具链（仅 C/C++ 编译器，不装系统 Python）====="
-          apk add --no-cache \
-            gcc g++ musl-dev libffi-dev openssl-dev make
+          echo "=== 安装编译工具链 ==="
+          apk add --no-cache gcc g++ musl-dev libffi-dev openssl-dev make
 
-          echo "===== 安装 Python 依赖 ====="
+          echo "=== 升级 pip ==="
           pip install --upgrade pip --quiet
-          # grpcio 优先用预编译轮子，实在没有才源码编译
-          pip install --quiet \
-            cython setuptools wheel python-minifier
-          pip install --quiet --prefer-binary \
-            grpcio protobuf pyyaml psutil requests flask aiohttp
 
-          echo "===== 混淆 main.py ====="
+          echo "=== 安装 Cython 工具 ==="
+          pip install --quiet cython setuptools wheel python-minifier
+
+          echo "=== 安装运行时依赖 ==="
+          pip install --prefer-binary --quiet \
+            protobuf pyyaml psutil requests flask aiohttp
+
+          echo "=== 安装 grpcio ==="
+          GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1 \
+          GRPC_PYTHON_BUILD_SYSTEM_ZLIB=1 \
+          GRPC_PYTHON_DISABLE_LIBC_COMPATIBILITY=1 \
+          pip install --prefer-binary grpcio
+
+          echo "=== 混淆 main.py ==="
           pyminify \
-            --remove-literal-statements \
-            --remove-asserts \
-            --remove-debug \
+            --remove-literal-statements --remove-asserts --remove-debug \
             --output main_obf.py main.py
-          [ -s main_obf.py ] || { echo "❌ 混淆产物为空"; exit 1; }
+          [ -s main_obf.py ] || { echo "❌ 混淆失败"; exit 1; }
           mv main_obf.py main.py
 
-          echo "===== 生成 setup.py ====="
+          echo "=== 生成 setup.py ==="
           cat > setup.py << 'SETUP_EOF'
           from setuptools import setup
           from Cython.Build import cythonize
-          setup(
-              name="monitor_worker",
-              ext_modules=cythonize(
-                  "main.py",
-                  compiler_directives={
-                      "language_level": "3",
-                      "always_allow_keywords": True,
-                  },
-                  annotate=False,
-              ),
-          )
+          setup(name="monitor_worker", ext_modules=cythonize(
+              "main.py",
+              compiler_directives={"language_level":"3","always_allow_keywords":True},
+              annotate=False,
+          ))
           SETUP_EOF
 
-          echo "===== 编译 ====="
+          echo "=== 编译 .so ==="
           python setup.py build_ext --inplace 2>&1
 
-          echo "===== 查找产物 ====="
+          echo "=== 检查产物 ==="
           SO=$(ls main.cpython-*.so 2>/dev/null | head -1)
-          if [ -z "${SO}" ]; then
-            echo "❌ 未找到 .so，当前目录:"
-            ls -la
-            exit 1
-          fi
+          [ -n "${SO}" ] || { echo "❌ 未找到 .so"; ls -la; exit 1; }
           echo "生成: ${SO}"
           ldd "${SO}" || true
 
-          echo "===== 移动产物 ====="
           mv "${SO}" "/output/${OUTFILE}"
           ls -lh "/output/${OUTFILE}"
-          echo "✅ 完成"
+          echo "✅ 编译完成"
           SCRIPT
 
           chmod +x "${{ github.workspace }}/scripts/build_musl.sh"
 
-          # ── 验证脚本 ────────────────────────────────────────────────────────
           cat > "${{ github.workspace }}/scripts/validate_musl.py" << 'PYEOF'
           import importlib.util, os, sys
-
           so = os.environ["SO_NAME"]
           path = f"/out/{so}"
-
           if not os.path.exists(path):
-              print(f"❌ 文件不存在: {path}", file=sys.stderr)
-              sys.exit(1)
+              print(f"❌ 不存在: {path}", file=sys.stderr); sys.exit(1)
           if os.path.getsize(path) == 0:
-              print(f"❌ 文件为空: {path}", file=sys.stderr)
-              sys.exit(1)
-
+              print(f"❌ 文件为空: {path}", file=sys.stderr); sys.exit(1)
           spec = importlib.util.spec_from_file_location("main", path)
           if spec is None:
-              print(f"❌ 无法加载 spec: {path}", file=sys.stderr)
-              sys.exit(1)
-
+              print(f"❌ 无法加载: {path}", file=sys.stderr); sys.exit(1)
           mod = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(mod)
-          print(f"✅ musl import OK | WorkerApp={hasattr(mod, 'WorkerApp')}")
+          print(f"✅ musl OK | WorkerApp={hasattr(mod,'WorkerApp')}")
           PYEOF
 
-          echo "✅ 脚本准备完成"
-
-      - name: 编译 musl .so（Alpine 容器内）
+      - name: 编译 musl .so
         run: |
           set -euo pipefail
-
           PY_VER="${{ matrix.python-version }}"
           ARCH="${{ matrix.arch }}"
           OUTFILE="main-${PY_VER}-${ARCH}-musl.so"
 
-          echo "▶ 启动容器: python:${PY_VER}-alpine"
+          echo "▶ python:${PY_VER}-alpine 编译 ${OUTFILE}"
           docker run --rm \
             -v "${{ github.workspace }}/src/agent-v1-so:/work" \
             -v "${{ github.workspace }}/output:/output" \
@@ -379,13 +295,11 @@ jobs:
             "python:${PY_VER}-alpine" \
             sh /scripts/build_musl.sh
 
-          echo "▶ 宿主机产物验证:"
           ls -lh "${{ github.workspace }}/output/"
           [ -s "${{ github.workspace }}/output/${OUTFILE}" ] \
-            || { echo "❌ 产物为空或不存在"; exit 1; }
-          echo "✅ 产物确认"
+            || { echo "❌ 产物缺失"; exit 1; }
 
-      - name: 验证 musl .so 导入（Alpine 容器内）
+      - name: 验证导入
         run: |
           PY_VER="${{ matrix.python-version }}"
           ARCH="${{ matrix.arch }}"
@@ -398,87 +312,55 @@ jobs:
             "python:${PY_VER}-alpine" \
             sh -c '
               set -e
-              # 同样只装运行时库，不装系统 python3
               apk add --no-cache libstdc++ libgcc --quiet
-              pip install --quiet --prefer-binary \
-                grpcio protobuf pyyaml psutil aiohttp
+              pip install --quiet --prefer-binary grpcio protobuf pyyaml psutil aiohttp
               python /scripts/validate_musl.py
             '
 
-      - name: 上传 musl .so 到 Draft Release
+      - name: 上传到 Draft Release
         env:
           GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
           UPLOAD_URL: ${{ needs.prepare.outputs.upload_url }}
         run: |
           set -euo pipefail
-
           PY_VER="${{ matrix.python-version }}"
           ARCH="${{ matrix.arch }}"
           BASENAME="main-${PY_VER}-${ARCH}-musl.so"
           FILE="${{ github.workspace }}/output/${BASENAME}"
 
-          if [[ -z "${UPLOAD_URL}" || "${UPLOAD_URL}" == "null" ]]; then
-            echo "❌ upload_url 无效"
-            exit 1
-          fi
-
-          if [[ ! -s "${FILE}" ]]; then
-            echo "❌ 产物文件不存在或为空: ${FILE}"
-            ls -la "${{ github.workspace }}/output/" || true
-            exit 1
-          fi
-
-          ls -lh "${FILE}"
+          [[ -s "${FILE}" ]] || { echo "❌ 产物缺失"; exit 1; }
           BASE_URL="${UPLOAD_URL%\{*}"
-          echo "▶ 上传 ${BASENAME} ..."
-
-          RESPONSE=$(curl -sS -w "\n%{http_code}" \
-            -X POST \
+          RESPONSE=$(curl -sS -w "\n%{http_code}" -X POST \
             -H "Authorization: token ${GH_TOKEN}" \
             -H "Content-Type: application/octet-stream" \
-            --data-binary @"${FILE}" \
-            "${BASE_URL}?name=${BASENAME}")
-
+            --data-binary @"${FILE}" "${BASE_URL}?name=${BASENAME}")
           HTTP_CODE=$(echo "${RESPONSE}" | tail -n1)
           BODY=$(echo "${RESPONSE}" | sed '$d')
-          echo "HTTP 状态码: ${HTTP_CODE}"
-
+          echo "HTTP: ${HTTP_CODE}"
           if [[ "${HTTP_CODE}" != "201" ]]; then
-            echo "❌ 上传失败，响应: ${BODY}"
+            echo "❌ 上传失败: ${BODY}"
             gh release delete "${{ needs.prepare.outputs.tag }}" \
-              --repo "${{ github.repository }}" \
-              --yes --cleanup-tag 2>/dev/null || true
-            echo "✅ 草稿已删除"
+              --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
             exit 1
           fi
-          echo "✅ 上传成功 (201)"
+          echo "✅ 上传成功"
 
 
 # JOB 4 · cleanup-on-failure
   cleanup-on-failure:
-    name: 失败时删除草稿 Release
+    name: 失败时删除草稿
     needs: [prepare, build, build-musl]
     if: ${{ failure() }}
     runs-on: ubuntu-latest
-
     steps:
       - name: 删除草稿 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG:      ${{ needs.prepare.outputs.tag }}
         run: |
-          set -euo pipefail
-          REPO="${{ github.repository }}"
-
-          if [[ -z "${TAG}" || "${TAG}" == "null" ]]; then
-            echo "⚠️  无有效 TAG，跳过删除"
-            exit 0
-          fi
-
-          echo "▶ 检测到失败，删除草稿 Release (tag=${TAG}) ..."
+          [[ -z "${TAG}" || "${TAG}" == "null" ]] && exit 0
           gh release delete "${TAG}" \
-            --repo "${REPO}" \
-            --yes --cleanup-tag 2>/dev/null || true
+            --repo "${{ github.repository }}" --yes --cleanup-tag 2>/dev/null || true
           echo "✅ 草稿已删除"
 
 # JOB 5 · publish
@@ -487,20 +369,15 @@ jobs:
     needs: [prepare, build, build-musl]
     if: ${{ success() }}
     runs-on: ubuntu-latest
-
     steps:
-      - name: 将 Draft → Published
+      - name: Draft → Published
         env:
           GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
           RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
         run: |
-          set -euo pipefail
-          REPO="${{ github.repository }}"
-          echo "▶ 发布 Release ID=${RELEASE_ID} ..."
-          gh api \
-            --method PATCH \
+          gh api --method PATCH \
             --header "Accept: application/vnd.github.v3+json" \
-            "repos/${REPO}/releases/${RELEASE_ID}" \
+            "repos/${{ github.repository }}/releases/${RELEASE_ID}" \
             --field draft=false
           echo "✅ 发布完成"
 
