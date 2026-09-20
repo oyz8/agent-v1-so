@@ -104,10 +104,6 @@ jobs:
           echo "✅ Draft Release 创建成功 ID=${RELEASE_ID}"
 
 # ╔══════════════════════════════════════════════════════════════════════════════
-# ║  公共上传函数（内联 shell function，两个 job 复用相同逻辑）
-# ╚══════════════════════════════════════════════════════════════════════════════
-
-# ╔══════════════════════════════════════════════════════════════════════════════
 # ║  JOB 2 · build（glibc）
 # ╚══════════════════════════════════════════════════════════════════════════════
   build:
@@ -194,7 +190,6 @@ jobs:
           SRC=$(ls main.cpython-*.so | head -1)
           DEST="main-${{ matrix.python-version }}-${{ matrix.arch }}.so"
           mv "${SRC}" "${DEST}"
-          # 将产物复制到固定路径，方便后续步骤引用
           cp "${DEST}" "${{ github.workspace }}/artifact.so"
           echo "filename=${DEST}" >> "$GITHUB_OUTPUT"
           ls -lh "${DEST}"
@@ -209,31 +204,25 @@ jobs:
           GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
           UPLOAD_URL: ${{ needs.prepare.outputs.upload_url }}
           FILENAME:   ${{ steps.artifact.outputs.filename }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
         run: |
           set -euo pipefail
 
-          # 验证 upload_url 有效
           if [[ -z "${UPLOAD_URL}" || "${UPLOAD_URL}" == "null" ]]; then
             echo "❌ upload_url 无效: '${UPLOAD_URL}'"
             exit 1
           fi
 
-          # 验证文件存在且非空
           FILE="${{ github.workspace }}/artifact.so"
           if [[ ! -s "${FILE}" ]]; then
             echo "❌ 产物文件不存在或为空: ${FILE}"
-            ls -la "${{ github.workspace }}/" || true
             exit 1
           fi
 
-          echo "▶ 文件信息:"
           ls -lh "${FILE}"
-
-          # 去除 {?name,label} 模板部分
           BASE_URL="${UPLOAD_URL%\{*}"
-          echo "▶ 上传 ${FILENAME} 到 ${BASE_URL} ..."
+          echo "▶ 上传 ${FILENAME} ..."
 
-          # 不使用 -f，手动检查状态码，便于打印响应体调试
           RESPONSE=$(curl -sS -w "\n%{http_code}" \
             -X POST \
             -H "Authorization: token ${GH_TOKEN}" \
@@ -243,11 +232,16 @@ jobs:
 
           HTTP_CODE=$(echo "${RESPONSE}" | tail -n1)
           BODY=$(echo "${RESPONSE}" | sed '$d')
-
           echo "HTTP 状态码: ${HTTP_CODE}"
+
           if [[ "${HTTP_CODE}" != "201" ]]; then
-            echo "❌ 上传失败"
-            echo "响应内容: ${BODY}"
+            echo "❌ 上传失败，响应: ${BODY}"
+            # ── 上传失败：删除本次草稿 Release ──────────────────────────────
+            echo "▶ 删除草稿 Release ID=${RELEASE_ID} ..."
+            gh release delete "${{ needs.prepare.outputs.tag }}" \
+              --repo "${{ github.repository }}" \
+              --yes --cleanup-tag 2>/dev/null || true
+            echo "✅ 草稿已删除"
             exit 1
           fi
           echo "✅ 上传成功 (201)"
@@ -287,12 +281,8 @@ jobs:
           PY_VER="${{ matrix.python-version }}"
           ARCH="${{ matrix.arch }}"
           OUTFILE="main-${PY_VER}-${ARCH}-musl.so"
-
-          # 确保输出目录存在
           mkdir -p "${{ github.workspace }}/output"
 
-          # -e OUTFILE 将宿主机变量注入容器环境
-          # heredoc 使用单引号，容器内脚本不做宿主机变量展开
           docker run --rm \
             -v "${{ github.workspace }}/src/agent-v1-so:/work" \
             -v "${{ github.workspace }}/output:/output" \
@@ -345,12 +335,10 @@ jobs:
           [ -n "${SO}" ] || { echo "❌ 未找到 .so"; exit 1; }
           echo "生成文件: ${SO}"
 
-          echo "▶ ldd 检查（仅供参考）"
           ldd "${SO}" || true
 
-          echo "▶ 移动产物到 /output/${OUTFILE}"
           mv "${SO}" "/output/${OUTFILE}"
-          echo "✅ 编译完成"
+          echo "✅ 编译完成: /output/${OUTFILE}"
           CONTAINER_SCRIPT
 
           echo "▶ 宿主机产物列表:"
@@ -372,10 +360,8 @@ jobs:
           pip install --quiet grpcio protobuf pyyaml psutil aiohttp
           cd /out
 
-          # 验证文件存在
           [ -f "${SO_NAME}" ] || { echo "❌ 文件不存在: ${SO_NAME}"; ls -la; exit 1; }
           [ -s "${SO_NAME}" ] || { echo "❌ 文件为空: ${SO_NAME}"; exit 1; }
-          echo "文件大小: $(ls -lh ${SO_NAME} | awk '{print $5}')"
 
           python - << 'PYEOF'
           import importlib.util, os, sys
@@ -400,30 +386,23 @@ jobs:
           PY_VER="${{ matrix.python-version }}"
           ARCH="${{ matrix.arch }}"
           BASENAME="main-${PY_VER}-${ARCH}-musl.so"
-          # 使用绝对路径，避免工作目录歧义
           FILE="${{ github.workspace }}/output/${BASENAME}"
 
-          # 验证 upload_url
           if [[ -z "${UPLOAD_URL}" || "${UPLOAD_URL}" == "null" ]]; then
             echo "❌ upload_url 无效"
             exit 1
           fi
 
-          # 验证文件存在且非空
           if [[ ! -s "${FILE}" ]]; then
             echo "❌ 产物文件不存在或为空: ${FILE}"
-            echo "output 目录内容:"
             ls -la "${{ github.workspace }}/output/" || true
             exit 1
           fi
 
-          echo "▶ 文件信息:"
           ls -lh "${FILE}"
-
           BASE_URL="${UPLOAD_URL%\{*}"
           echo "▶ 上传 ${BASENAME} ..."
 
-          # 不用 -f，手动检查状态码
           RESPONSE=$(curl -sS -w "\n%{http_code}" \
             -X POST \
             -H "Authorization: token ${GH_TOKEN}" \
@@ -433,17 +412,53 @@ jobs:
 
           HTTP_CODE=$(echo "${RESPONSE}" | tail -n1)
           BODY=$(echo "${RESPONSE}" | sed '$d')
-
           echo "HTTP 状态码: ${HTTP_CODE}"
+
           if [[ "${HTTP_CODE}" != "201" ]]; then
-            echo "❌ 上传失败"
-            echo "响应内容: ${BODY}"
+            echo "❌ 上传失败，响应: ${BODY}"
+            # ── 上传失败：删除本次草稿 Release ──────────────────────────────
+            echo "▶ 删除草稿 Release ID=${{ needs.prepare.outputs.release_id }} ..."
+            gh release delete "${{ needs.prepare.outputs.tag }}" \
+              --repo "${{ github.repository }}" \
+              --yes --cleanup-tag 2>/dev/null || true
+            echo "✅ 草稿已删除"
             exit 1
           fi
           echo "✅ 上传成功 (201)"
 
 # ╔══════════════════════════════════════════════════════════════════════════════
-# ║  JOB 4 · publish
+# ║  JOB 4 · cleanup-on-failure（任意编译 job 失败时删除草稿）
+# ╚══════════════════════════════════════════════════════════════════════════════
+  cleanup-on-failure:
+    name: 失败时删除草稿 Release
+    needs: [prepare, build, build-musl]
+    # build 或 build-musl 中有任意 job 失败时触发
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 删除草稿 Release
+        env:
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+          TAG:        ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+
+          if [[ -z "${RELEASE_ID}" || "${RELEASE_ID}" == "null" ]]; then
+            echo "⚠️  无有效 RELEASE_ID，跳过删除"
+            exit 0
+          fi
+
+          echo "▶ 检测到编译失败，删除草稿 Release ID=${RELEASE_ID} (tag=${TAG}) ..."
+          gh release delete "${TAG}" \
+            --repo "${REPO}" \
+            --yes --cleanup-tag 2>/dev/null || true
+          echo "✅ 草稿已删除"
+
+# ╔══════════════════════════════════════════════════════════════════════════════
+# ║  JOB 5 · publish（全部成功才发布）
 # ╚══════════════════════════════════════════════════════════════════════════════
   publish:
     name: 正式发布 Release
