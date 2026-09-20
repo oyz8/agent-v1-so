@@ -3,158 +3,193 @@ name: 编译 .so（全版本）发布统一 Release
 on:
   workflow_dispatch:
 
+# ── 全局变量 ──────────────────────────────────────────────────────────────────
+env:
+  REPO_OWNER:   ${{ github.repository_owner }}
+  REPO:         ${{ github.repository }}
+  RUN_NUMBER:   ${{ github.run_number }}
+  ACTOR:        ${{ github.actor }}
+  SHA:          ${{ github.sha }}
+
+# ── 默认权限（最小化） ──────────────────────────────────────────────────────
+permissions:
+  contents: write
+  actions:  write
+
 jobs:
+# ╔══════════════════════════════════════════════════════════════════════════════
+# ║  JOB 1 · prepare
+# ╚══════════════════════════════════════════════════════════════════════════════
   prepare:
-    name: 清理并创建 Draft Release
+    name: 清理历史 & 创建 Draft Release
     runs-on: ubuntu-latest
     outputs:
       upload_url: ${{ steps.create_draft.outputs.upload_url }}
       release_id: ${{ steps.create_draft.outputs.release_id }}
-      tag: ${{ steps.tag.outputs.tag }}
-    permissions:
-      contents: write
+      tag:        ${{ steps.meta.outputs.tag }}
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      # ── 生成本次统一标签 ────────────────────────────────────────────────────
+      - name: 生成元数据
+        id: meta
+        run: |
+          TAG="main.so-v${RUN_NUMBER}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "生成标签: ${TAG}"
 
-      - name: 生成统一标签
-        id: tag
-        run: echo "tag=main.so-v${{ github.run_number }}" >> $GITHUB_OUTPUT
-
-      - name: 清理历史 Release（保留最近一次已发布版本）
+      # ── 清理旧 Release（保留最新一条已发布版本）──────────────────────────
+      - name: 清理历史 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          echo "查找最新非草稿 Release ..."
-          KEEP_ID=$(curl -sS -H "Authorization: token $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/releases?per_page=5" | \
-            jq -r '[.[] | select(.draft == false)] | .[0].id')
-          if [ "$KEEP_ID" != "null" ] && [ -n "$KEEP_ID" ]; then
-            echo "保留最新 Release ID: $KEEP_ID"
+          set -euo pipefail
+
+          echo "▶ 查找最新已发布 Release ..."
+          KEEP_ID=$(gh api "repos/${REPO}/releases?per_page=10" \
+            --jq '[.[] | select(.draft == false)] | .[0].id // empty')
+
+          if [[ -n "${KEEP_ID}" ]]; then
+            echo "  保留 Release ID: ${KEEP_ID}"
           else
-            echo "没有可保留的 Release，将全部清理。"
-            KEEP_ID=""
+            echo "  无已发布 Release，全部清理"
           fi
 
-          echo "开始清理历史 Release ..."
-          for page in $(seq 1 20); do
-            data=$(curl -sS -H "Authorization: token $GH_TOKEN" \
-              "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100&page=$page")
-            items=$(echo "$data" | jq -c '.[] | {id: .id, tag_name: .tag_name}' 2>/dev/null)
-            [ -z "$items" ] && break
-            while read -r item; do
-              id=$(echo "$item" | jq -r '.id')
-              tag=$(echo "$item" | jq -r '.tag_name')
-              if [ "$id" = "$KEEP_ID" ]; then
-                echo "跳过保留: $tag (ID: $id)"
+          echo "▶ 开始分页删除..."
+          PAGE=1
+          while true; do
+            # 取出每页 release 的 id 与 tag_name
+            ITEMS=$(gh api "repos/${REPO}/releases?per_page=100&page=${PAGE}" \
+              --jq '.[] | "\(.id) \(.tag_name)"' 2>/dev/null || true)
+            [[ -z "${ITEMS}" ]] && break
+
+            while IFS=" " read -r ID TAG_NAME; do
+              if [[ "${ID}" == "${KEEP_ID}" ]]; then
+                echo "  跳过保留: ${TAG_NAME} (${ID})"
                 continue
               fi
-              echo "删除 Release 及标签: $tag"
-              gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
-            done <<< "$items"
-          done
-          echo "清理完成！"
+              echo "  删除: ${TAG_NAME} (${ID})"
+              # --cleanup-tag 同时删除对应 Git 标签
+              gh release delete "${TAG_NAME}" \
+                --repo "${REPO}" --yes --cleanup-tag 2>/dev/null || true
+            done <<< "${ITEMS}"
 
-      - name: 创建 Draft Release（body 从 RELEASE_NOTES.md 读取）
+            (( PAGE++ ))
+          done
+          echo "✅ 清理完成"
+
+      # ── 创建 Draft Release ─────────────────────────────────────────────────
+      - name: 创建 Draft Release
         id: create_draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG:      ${{ steps.meta.outputs.tag }}
         run: |
-          set -e
+          set -euo pipefail
 
-          # 如果文件不存在，给出兜底内容
-          if [ ! -f RELEASE_NOTES.md ]; then
-            echo "RELEASE_NOTES.md 不存在，使用默认说明"
-            echo "编译中..." > RELEASE_NOTES.md
-          fi
+          # 用 printf 构造 JSON body，避免变量中特殊字符导致 JSON 非法
+          RELEASE_BODY=$(printf '%s' \
+            "## main.so 全版本合集\n\n" \
+            "本 Release 由 GitHub Actions 自动编译，包含 **glibc** 与 **musl** 两套原生扩展。\n\n" \
+            "### 文件命名规则\n\n\`\`\`\n" \
+            "main-{python}-{arch}.so       # glibc（VPS / Debian / Ubuntu）\n" \
+            "main-{python}-{arch}-musl.so  # musl（Alpine / Unikraft Cloud）\n" \
+            "\`\`\`\n\n" \
+            "### 架构与 Python 版本\n\n" \
+            "- **架构**：\`amd64\`、\`arm64\`\n" \
+            "- **Python**：\`3.8\` ~ \`3.13\`（musl），\`3.8\` ~ \`3.14\`（glibc）\n\n" \
+            "### 提交信息\n\n" \
+            "- Commit: \`${SHA}\`\n" \
+            "- 触发者: @${ACTOR}\n" \
+            "- 运行编号: #${RUN_NUMBER}")
 
-          # jq -Rs . 把多行文本转义成合法的 JSON 字符串
-          NOTES_BODY=$(jq -Rs . < RELEASE_NOTES.md)
+          # jq 负责将所有字段正确序列化为合法 JSON
+          PAYLOAD=$(jq -n \
+            --arg tag  "${TAG}" \
+            --arg name "main.so 全版本合集 | #${RUN_NUMBER}" \
+            --arg body "${RELEASE_BODY}" \
+            '{tag_name:$tag, name:$name, body:$body, draft:true, prerelease:false}')
 
-          # 用 jq 构造整个请求体，避免手写 JSON 容易漏转义
-          REQ_BODY=$(jq -n \
-            --arg tag   "${{ steps.tag.outputs.tag }}" \
-            --arg name  "main.so 全版本合集 | #${{ github.run_number }}" \
-            --argjson body "$NOTES_BODY" \
-            '{tag_name: $tag, name: $name, body: $body, draft: true, prerelease: false}')
+          echo "▶ 创建 Draft Release (tag=${TAG}) ..."
+          RESPONSE=$(gh api \
+            --method POST \
+            --header "Accept: application/vnd.github.v3+json" \
+            "repos/${REPO}/releases" \
+            --input - <<< "${PAYLOAD}")
 
-          echo "===== 请求体预览 ====="
-          echo "$REQ_BODY" | jq -r '.body' | head -20
-          echo "======================"
+          UPLOAD_URL=$(echo "${RESPONSE}" | jq -r '.upload_url')
+          RELEASE_ID=$(echo "${RESPONSE}" | jq -r '.id')
 
-          response=$(curl -sS -w "\n%{http_code}" -X POST \
-            -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases" \
-            -d "$REQ_BODY")
-
-          http_code=$(echo "$response" | tail -n1)
-          body=$(echo "$response" | sed '$d')
-          echo "HTTP 状态码: $http_code"
-          if [ "$http_code" != "201" ]; then
-            echo "创建失败，响应内容："
-            echo "$body"
+          if [[ -z "${UPLOAD_URL}" || "${UPLOAD_URL}" == "null" ]]; then
+            echo "❌ 未获取到有效 upload_url，响应："
+            echo "${RESPONSE}"
             exit 1
           fi
 
-          upload_url=$(echo "$body" | jq -r '.upload_url')
-          release_id=$(echo "$body" | jq -r '.id')
-          if [ "$upload_url" = "null" ] || [ -z "$upload_url" ]; then
-            echo "错误：未从响应中提取到有效的 upload_url"
-            echo "响应原文：$body"
-            exit 1
-          fi
-          echo "upload_url=$upload_url" >> $GITHUB_OUTPUT
-          echo "release_id=$release_id" >> $GITHUB_OUTPUT
-          echo "Draft Release 创建成功: ID=$release_id"
+          echo "upload_url=${UPLOAD_URL}" >> "$GITHUB_OUTPUT"
+          echo "release_id=${RELEASE_ID}" >> "$GITHUB_OUTPUT"
+          echo "✅ Draft Release 创建成功 ID=${RELEASE_ID}"
 
-  # ============ glibc 版本（VPS 使用） ============
+# ╔══════════════════════════════════════════════════════════════════════════════
+# ║  JOB 2 · build  (glibc，原生 runner)
+# ╚══════════════════════════════════════════════════════════════════════════════
   build:
-    name: 编译 glibc .so (${{ matrix.python-version }} ${{ matrix.arch }})
+    name: glibc · py${{ matrix.python-version }} · ${{ matrix.arch }}
     needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        arch:           [amd64, arm64]
         include:
           - arch: amd64
             runner: ubuntu-22.04
           - arch: arm64
             runner: ubuntu-22.04-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
-    permissions:
-      contents: write
-      actions: write
+
     steps:
-      - name: 拉取私有仓库源码
+      - name: 拉取源码
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/scripts
-          token: ${{ secrets.REPO_TOKEN }}
-          path: .
+          token:      ${{ secrets.REPO_TOKEN }}
+          path:       .
 
       - name: 配置 Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
+      # pip 依赖缓存（以 requirements hash 或 python 版本为 key）
+      - name: 缓存 pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-glibc-${{ matrix.python-version }}-${{ matrix.arch }}-${{ hashFiles('**/requirements*.txt') }}
+          restore-keys: pip-glibc-${{ matrix.python-version }}-${{ matrix.arch }}-
+
       - name: 安装编译依赖
         run: |
           pip install --upgrade pip
-          pip install cython setuptools wheel python-minifier
-          pip install grpcio protobuf pyyaml psutil requests flask aiohttp
+          pip install cython setuptools wheel python-minifier \
+                      grpcio protobuf pyyaml psutil requests flask aiohttp
 
       - name: 混淆 main.py
         working-directory: agent-v1-so
         run: |
-          pyminify --remove-literal-statements --remove-asserts --remove-debug --output main_obf.py main.py
-          [ -s main_obf.py ] || { echo "混淆失败"; exit 1; }
+          pyminify \
+            --remove-literal-statements \
+            --remove-asserts \
+            --remove-debug \
+            --output main_obf.py \
+            main.py
+          [[ -s main_obf.py ]] || { echo "❌ 混淆产物为空"; exit 1; }
           mv main_obf.py main.py
+          echo "✅ 混淆完成"
 
-      - name: 编译为 .so
+      - name: 生成 setup.py 并编译 .so
         working-directory: agent-v1-so
         run: |
           cat > setup.py << 'EOF'
@@ -164,197 +199,225 @@ jobs:
               name="monitor_worker",
               ext_modules=cythonize(
                   "main.py",
-                  compiler_directives={'language_level': "3", 'always_allow_keywords': True},
+                  compiler_directives={
+                      "language_level": "3",
+                      "always_allow_keywords": True,
+                  },
                   annotate=False,
               ),
           )
           EOF
           python setup.py build_ext --inplace
-          ls main*.so || { echo "未生成 .so"; exit 1; }
+          ls main*.so || { echo "❌ 未找到生成的 .so"; exit 1; }
 
-      - name: 重命名（含版本-架构）
+      - name: 重命名（含版本与架构）
+        id: rename
         working-directory: agent-v1-so
         run: |
-          mv $(ls main.cpython-*.so | head -1) main-${{ matrix.python-version }}-${{ matrix.arch }}.so
-          ls -lh main-${{ matrix.python-version }}-${{ matrix.arch }}.so
+          SRC=$(ls main.cpython-*.so | head -1)
+          DEST="main-${{ matrix.python-version }}-${{ matrix.arch }}.so"
+          mv "${SRC}" "${DEST}"
+          ls -lh "${DEST}"
+          echo "filename=${DEST}" >> "$GITHUB_OUTPUT"
 
       - name: 验证导入
         working-directory: agent-v1-so
-        run: python -c "import main; print('✅ glibc ${{ matrix.python-version }} ${{ matrix.arch }}')"
+        run: |
+          python -c "import main; print('✅ glibc ${{ matrix.python-version }} ${{ matrix.arch }} 导入成功')"
 
-      - name: 直接上传到 Draft Release
+      - name: 上传到 Draft Release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          UPLOAD_URL: ${{ needs.prepare.outputs.upload_url }}
+          FILENAME:   ${{ steps.rename.outputs.filename }}
         working-directory: agent-v1-so
         run: |
-          set -e
-          UPLOAD_URL="${{ needs.prepare.outputs.upload_url }}"
-          if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
-            echo "错误：从 prepare 作业获取的 upload_url 无效: '$UPLOAD_URL'"
-            exit 1
-          fi
-          BASE_URL="${UPLOAD_URL%\{*}"
-          FILE="main-${{ matrix.python-version }}-${{ matrix.arch }}.so"
-          echo "上传 $FILE ..."
-          HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
-            -H "Authorization: token $GH_TOKEN" \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary @"$FILE" \
-            "$BASE_URL?name=$FILE")
-          if [ "$HTTP_CODE" != "201" ]; then
-            echo "上传失败，HTTP 状态码: $HTTP_CODE"
-            exit 1
-          fi
-          echo "上传成功 (201)"
+          set -euo pipefail
+          ./../.github/scripts/upload_asset.sh "${UPLOAD_URL}" "${FILENAME}"
 
-  # ============ musl 版本（Unikraft / Alpine 使用） ============
+# ╔══════════════════════════════════════════════════════════════════════════════
+# ║  JOB 3 · build-musl  (Alpine 容器)
+# ╚══════════════════════════════════════════════════════════════════════════════
   build-musl:
-    name: 编译 musl .so (${{ matrix.python-version }} ${{ matrix.arch }})
+    name: musl · py${{ matrix.python-version }} · ${{ matrix.arch }}
     needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        arch:           [amd64, arm64]
         include:
           - arch: amd64
             runner: ubuntu-22.04
           - arch: arm64
             runner: ubuntu-22.04-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    permissions:
-      contents: write
-      actions: write
+
     steps:
-      - name: 拉取私有仓库源码
+      - name: 拉取源码
         uses: actions/checkout@v4
         with:
           repository: ${{ github.repository_owner }}/scripts
-          token: ${{ secrets.REPO_TOKEN }}
-          path: .
+          token:      ${{ secrets.REPO_TOKEN }}
+          path:       .
 
-      - name: 用 Alpine 容器编译 musl .so
+      - name: 编译 musl .so（Alpine 容器内）
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p output
+
+          PY_VER="${{ matrix.python-version }}"
+          ARCH="${{ matrix.arch }}"
+          OUTFILE="main-${PY_VER}-${ARCH}-musl.so"
+
           docker run --rm \
             -v "$PWD:/work" \
             -w /work/agent-v1-so \
-            python:${{ matrix.python-version }}-alpine \
-            sh -c '
-              set -e
-              apk add --no-cache \
-                gcc musl-dev python3-dev libffi-dev openssl-dev cargo make
+            "python:${PY_VER}-alpine" \
+            sh -c "$(cat << 'DOCKER_EOF'
+          set -e
 
-              pip install --upgrade pip
-              pip install cython setuptools wheel python-minifier
-              pip install grpcio protobuf pyyaml psutil requests flask aiohttp
+          echo "▶ 安装系统依赖"
+          apk add --no-cache \
+            gcc musl-dev python3-dev libffi-dev openssl-dev cargo make
 
-              echo "===== 混淆 main.py ====="
-              pyminify --remove-literal-statements --remove-asserts --remove-debug \
-                --output main_obf.py main.py
-              [ -s main_obf.py ] || { echo "混淆失败"; exit 1; }
-              mv main_obf.py main.py
+          echo "▶ 安装 Python 依赖"
+          pip install --upgrade pip --quiet
+          pip install --quiet \
+            cython setuptools wheel python-minifier \
+            grpcio protobuf pyyaml psutil requests flask aiohttp
 
-              echo "===== 编译为 musl .so ====="
-              cat > setup.py << "EOF"
-from setuptools import setup
-from Cython.Build import cythonize
-setup(
-    name="monitor_worker",
-    ext_modules=cythonize(
-        "main.py",
-        compiler_directives={"language_level": "3", "always_allow_keywords": True},
-        annotate=False,
-    ),
-)
-EOF
-              python setup.py build_ext --inplace
-              SO=$(ls main.cpython-*.so | head -1)
-              [ -n "$SO" ] || { echo "未生成 .so"; exit 1; }
-              echo "生成: $SO"
+          echo "▶ 混淆 main.py"
+          pyminify \
+            --remove-literal-statements \
+            --remove-asserts \
+            --remove-debug \
+            --output main_obf.py main.py
+          [ -s main_obf.py ] || { echo "❌ 混淆产物为空"; exit 1; }
+          mv main_obf.py main.py
 
-              echo "===== 检查链接 (ldd) ====="
-              ldd "$SO" || true
+          echo "▶ 生成 setup.py"
+          cat > setup.py << 'EOF'
+          from setuptools import setup
+          from Cython.Build import cythonize
+          setup(
+              name="monitor_worker",
+              ext_modules=cythonize(
+                  "main.py",
+                  compiler_directives={
+                      "language_level": "3",
+                      "always_allow_keywords": True,
+                  },
+                  annotate=False,
+              ),
+          )
+          EOF
 
-              mv "$SO" "../output/main-${{ matrix.python-version }}-${{ matrix.arch }}-musl.so"
-            '
+          echo "▶ 编译"
+          python setup.py build_ext --inplace
+
+          SO=$(ls main.cpython-*.so 2>/dev/null | head -1)
+          [ -n "${SO}" ] || { echo "❌ 未找到 .so"; exit 1; }
+          echo "生成文件: ${SO}"
+
+          echo "▶ ldd 检查链接"
+          ldd "${SO}" || true
+
+          mv "${SO}" "/work/output/${OUTFILE}"
+          DOCKER_EOF
+          )"
+
+          echo "▶ 产物列表:"
           ls -lh output/
 
-      - name: 在 Alpine 中验证导入
+        env:
+          OUTFILE: "main-${{ matrix.python-version }}-${{ matrix.arch }}-musl.so"
+
+      # ── 在 Alpine 中验证导入 ───────────────────────────────────────────────
+      - name: 验证 musl .so 导入
         run: |
+          PY_VER="${{ matrix.python-version }}"
+          ARCH="${{ matrix.arch }}"
+          SO="main-${PY_VER}-${ARCH}-musl.so"
+
           docker run --rm \
             -v "$PWD/output:/out" \
-            python:${{ matrix.python-version }}-alpine \
-            sh -c '
-              apk add --no-cache libstdc++ libgcc
+            "python:${PY_VER}-alpine" \
+            sh -c "
+              set -e
+              apk add --no-cache libstdc++ libgcc --quiet
               pip install --quiet grpcio protobuf pyyaml psutil aiohttp
               cd /out
-              python - << "PYEOF"
-import importlib.util
-spec = importlib.util.spec_from_file_location(
-    "main", "main-${{ matrix.python-version }}-${{ matrix.arch }}-musl.so"
-)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-print("✅ musl import OK, has WorkerApp:", hasattr(mod, "WorkerApp"))
-PYEOF
-            '
+              python - << 'PYEOF'
+          import importlib.util, sys
+          so = '${SO}'
+          spec = importlib.util.spec_from_file_location('main', so)
+          mod  = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          print(f'✅ musl import OK | WorkerApp={hasattr(mod, \"WorkerApp\")}')
+          PYEOF
+            "
 
+      # ── 上传 ──────────────────────────────────────────────────────────────
       - name: 上传 musl .so 到 Draft Release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          UPLOAD_URL: ${{ needs.prepare.outputs.upload_url }}
         run: |
-          set -e
-          UPLOAD_URL="${{ needs.prepare.outputs.upload_url }}"
-          if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
-            echo "错误：upload_url 无效"
-            exit 1
-          fi
-          BASE_URL="${UPLOAD_URL%\{*}"
+          set -euo pipefail
           FILE="output/main-${{ matrix.python-version }}-${{ matrix.arch }}-musl.so"
-          echo "上传 $FILE ..."
-          HTTP_CODE=$(curl -sS -o /dev/null -w "%{http_code}" -X POST \
-            -H "Authorization: token $GH_TOKEN" \
+          BASENAME=$(basename "${FILE}")
+
+          BASE_URL="${UPLOAD_URL%\{*}"
+          echo "▶ 上传 ${BASENAME} ..."
+          HTTP_CODE=$(curl -fsSL -o /dev/null -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
             -H "Content-Type: application/octet-stream" \
-            --data-binary @"$FILE" \
-            "$BASE_URL?name=main-${{ matrix.python-version }}-${{ matrix.arch }}-musl.so")
-          if [ "$HTTP_CODE" != "201" ]; then
-            echo "上传失败，HTTP: $HTTP_CODE"
+            --data-binary @"${FILE}" \
+            "${BASE_URL}?name=${BASENAME}")
+
+          if [[ "${HTTP_CODE}" != "201" ]]; then
+            echo "❌ 上传失败，HTTP ${HTTP_CODE}"
             exit 1
           fi
-          echo "上传成功 (201)"
+          echo "✅ 上传成功 (201)"
 
+# ╔══════════════════════════════════════════════════════════════════════════════
+# ║  JOB 4 · publish
+# ╚══════════════════════════════════════════════════════════════════════════════
   publish:
     name: 正式发布 Release
     needs: [prepare, build, build-musl]
-    if: success()
+    # 只要所有编译 job 都成功（无论是否有失败矩阵分支）才发布
+    if: ${{ success() }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      actions: write
+
     steps:
-      - name: 发布 Release（取消草稿状态）
+      - name: 将 Draft → Published
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
           RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
         run: |
-          echo "发布 Release (ID: $RELEASE_ID) ..."
-          curl -sS -X PATCH \
-            -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID" \
-            -d '{"draft":false}'
-          echo "发布完成"
+          set -euo pipefail
+          echo "▶ 发布 Release ID=${RELEASE_ID} ..."
+          gh api \
+            --method PATCH \
+            --header "Accept: application/vnd.github.v3+json" \
+            "repos/${REPO}/releases/${RELEASE_ID}" \
+            --field draft=false
+          echo "✅ 发布完成"
 
+      # ── 清理历史运行记录 ──────────────────────────────────────────────────
       - name: 清理历史运行记录
         if: always()
         continue-on-error: true
         uses: Mattraks/delete-workflow-runs@v2
         with:
-          token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          delete_workflow_pattern: ${{ github.workflow }}
-          retain_days: 0
-          keep_minimum_runs: 3
+          token:                    ${{ github.token }}
+          repository:               ${{ github.repository }}
+          delete_workflow_pattern:  ${{ github.workflow }}
+          retain_days:              0
+          keep_minimum_runs:        3
