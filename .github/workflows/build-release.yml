@@ -77,11 +77,10 @@ jobs:
           ACTOR="${{ github.actor }}"
           SHA="${{ github.sha }}"
 
-          # 用 jq 构造合法 JSON，避免特殊字符破坏结构
           PAYLOAD=$(jq -n \
             --arg tag  "${TAG}" \
             --arg name "main.so 全版本合集 | #${RUN_NUMBER}" \
-            --arg body "## main.so 全版本合集\n\n本 Release 由 GitHub Actions 自动编译，包含 **glibc** 与 **musl** 两套原生扩展。\n\n### 文件命名规则\n\n\`\`\`\nmain-{python}-{arch}.so       # glibc（VPS / Debian / Ubuntu）\nmain-{python}-{arch}-musl.so  # musl（Alpine / Unikraft Cloud）\n\`\`\`\n\n### 架构与 Python 版本\n\n- **架构**：\`amd64\`、\`arm64\`\n- **Python**：\`3.8\` ~ \`3.13\`（musl），\`3.8\` ~ \`3.14\`（glibc）\n\n### 提交信息\n\n- Commit: \`${SHA}\`\n- 触发者: @${ACTOR}\n- 运行编号: #${RUN_NUMBER}" \
+            --arg body "## main.so 全版本合集\n\n本 Release 由 GitHub Actions 自动编译，包含 **glibc** 与 **musl** 两套原生扩展。\n\n### 文件命名规则\n\n\`\`\`\nmain-{python}-{arch}.so       # glibc（VPS / Debian / Ubuntu）\nmain-{python}-{arch}-musl.so  # musl（Alpine / Unikraft Cloud）\n\`\`\`\n\n### 提交信息\n\n- Commit: \`${SHA}\`\n- 触发者: @${ACTOR}\n- 运行编号: #${RUN_NUMBER}" \
             '{tag_name:$tag, name:$name, body:$body, draft:true, prerelease:false}')
 
           echo "▶ 创建 Draft Release (tag=${TAG}) ..."
@@ -95,7 +94,7 @@ jobs:
           RELEASE_ID=$(echo "${RESPONSE}" | jq -r '.id')
 
           if [[ -z "${UPLOAD_URL}" || "${UPLOAD_URL}" == "null" ]]; then
-            echo "❌ 未获取到有效 upload_url，响应："
+            echo "❌ 未获取到有效 upload_url"
             echo "${RESPONSE}"
             exit 1
           fi
@@ -105,7 +104,11 @@ jobs:
           echo "✅ Draft Release 创建成功 ID=${RELEASE_ID}"
 
 # ╔══════════════════════════════════════════════════════════════════════════════
-# ║  JOB 2 · build（glibc，原生 runner）
+# ║  公共上传函数（内联 shell function，两个 job 复用相同逻辑）
+# ╚══════════════════════════════════════════════════════════════════════════════
+
+# ╔══════════════════════════════════════════════════════════════════════════════
+# ║  JOB 2 · build（glibc）
 # ╚══════════════════════════════════════════════════════════════════════════════
   build:
     name: glibc · py${{ matrix.python-version }} · ${{ matrix.arch }}
@@ -130,7 +133,7 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/scripts
           token:      ${{ secrets.REPO_TOKEN }}
-          path:       .
+          path:       src
 
       - name: 配置 Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -141,8 +144,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-glibc-${{ matrix.python-version }}-${{ matrix.arch }}-${{ hashFiles('**/requirements*.txt') }}
-          restore-keys: pip-glibc-${{ matrix.python-version }}-${{ matrix.arch }}-
+          key: pip-glibc-${{ matrix.python-version }}-${{ matrix.arch }}
+          restore-keys: pip-glibc-${{ matrix.python-version }}-
 
       - name: 安装编译依赖
         run: |
@@ -151,7 +154,7 @@ jobs:
                       grpcio protobuf pyyaml psutil requests flask aiohttp
 
       - name: 混淆 main.py
-        working-directory: agent-v1-so
+        working-directory: src/agent-v1-so
         run: |
           pyminify \
             --remove-literal-statements \
@@ -164,7 +167,7 @@ jobs:
           echo "✅ 混淆完成"
 
       - name: 编译 .so
-        working-directory: agent-v1-so
+        working-directory: src/agent-v1-so
         run: |
           cat > setup.py << 'EOF'
           from setuptools import setup
@@ -184,49 +187,67 @@ jobs:
           python setup.py build_ext --inplace
           ls main*.so || { echo "❌ 未找到生成的 .so"; exit 1; }
 
-      - name: 重命名（含版本与架构）
-        id: rename
-        working-directory: agent-v1-so
+      - name: 重命名并收集产物
+        id: artifact
+        working-directory: src/agent-v1-so
         run: |
           SRC=$(ls main.cpython-*.so | head -1)
           DEST="main-${{ matrix.python-version }}-${{ matrix.arch }}.so"
           mv "${SRC}" "${DEST}"
-          ls -lh "${DEST}"
+          # 将产物复制到固定路径，方便后续步骤引用
+          cp "${DEST}" "${{ github.workspace }}/artifact.so"
           echo "filename=${DEST}" >> "$GITHUB_OUTPUT"
+          ls -lh "${DEST}"
 
       - name: 验证导入
-        working-directory: agent-v1-so
+        working-directory: src/agent-v1-so
         run: |
           python -c "import main; print('✅ glibc ${{ matrix.python-version }} ${{ matrix.arch }} 导入成功')"
 
-      # ── 修复：直接内联上传逻辑，不依赖外部脚本 ──────────────────────────
       - name: 上传到 Draft Release
         env:
           GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
           UPLOAD_URL: ${{ needs.prepare.outputs.upload_url }}
-        working-directory: agent-v1-so
+          FILENAME:   ${{ steps.artifact.outputs.filename }}
         run: |
           set -euo pipefail
-          FILE="${{ steps.rename.outputs.filename }}"
 
+          # 验证 upload_url 有效
           if [[ -z "${UPLOAD_URL}" || "${UPLOAD_URL}" == "null" ]]; then
             echo "❌ upload_url 无效: '${UPLOAD_URL}'"
             exit 1
           fi
 
+          # 验证文件存在且非空
+          FILE="${{ github.workspace }}/artifact.so"
+          if [[ ! -s "${FILE}" ]]; then
+            echo "❌ 产物文件不存在或为空: ${FILE}"
+            ls -la "${{ github.workspace }}/" || true
+            exit 1
+          fi
+
+          echo "▶ 文件信息:"
+          ls -lh "${FILE}"
+
           # 去除 {?name,label} 模板部分
           BASE_URL="${UPLOAD_URL%\{*}"
-          echo "▶ 上传 ${FILE} ..."
+          echo "▶ 上传 ${FILENAME} 到 ${BASE_URL} ..."
 
-          HTTP_CODE=$(curl -fsSL -o /dev/null -w "%{http_code}" \
+          # 不使用 -f，手动检查状态码，便于打印响应体调试
+          RESPONSE=$(curl -sS -w "\n%{http_code}" \
             -X POST \
             -H "Authorization: token ${GH_TOKEN}" \
             -H "Content-Type: application/octet-stream" \
             --data-binary @"${FILE}" \
-            "${BASE_URL}?name=${FILE}")
+            "${BASE_URL}?name=${FILENAME}")
 
+          HTTP_CODE=$(echo "${RESPONSE}" | tail -n1)
+          BODY=$(echo "${RESPONSE}" | sed '$d')
+
+          echo "HTTP 状态码: ${HTTP_CODE}"
           if [[ "${HTTP_CODE}" != "201" ]]; then
-            echo "❌ 上传失败，HTTP ${HTTP_CODE}"
+            echo "❌ 上传失败"
+            echo "响应内容: ${BODY}"
             exit 1
           fi
           echo "✅ 上传成功 (201)"
@@ -257,30 +278,33 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/scripts
           token:      ${{ secrets.REPO_TOKEN }}
-          path:       .
+          path:       src
 
-      # ── 修复：拆分变量展开与 heredoc，避免嵌套层次混乱 ──────────────────
       - name: 编译 musl .so（Alpine 容器内）
         run: |
           set -euo pipefail
-          mkdir -p output
 
           PY_VER="${{ matrix.python-version }}"
           ARCH="${{ matrix.arch }}"
           OUTFILE="main-${PY_VER}-${ARCH}-musl.so"
 
-          # 将需要在容器内使用的变量通过环境变量传入
-          # 容器内脚本全部用单引号 heredoc，不做宿主机变量展开
+          # 确保输出目录存在
+          mkdir -p "${{ github.workspace }}/output"
+
+          # -e OUTFILE 将宿主机变量注入容器环境
+          # heredoc 使用单引号，容器内脚本不做宿主机变量展开
           docker run --rm \
-            -v "$PWD:/work" \
+            -v "${{ github.workspace }}/src/agent-v1-so:/work" \
+            -v "${{ github.workspace }}/output:/output" \
             -e "OUTFILE=${OUTFILE}" \
-            -w /work/agent-v1-so \
+            -w /work \
             "python:${PY_VER}-alpine" \
-            sh << 'DOCKER_SCRIPT'
+            sh << 'CONTAINER_SCRIPT'
           set -e
 
           echo "▶ 安装系统依赖"
-          apk add --no-cache gcc musl-dev python3-dev libffi-dev openssl-dev cargo make
+          apk add --no-cache \
+            gcc musl-dev python3-dev libffi-dev openssl-dev cargo make
 
           echo "▶ 安装 Python 依赖"
           pip install --upgrade pip --quiet
@@ -297,7 +321,7 @@ jobs:
           [ -s main_obf.py ] || { echo "❌ 混淆产物为空"; exit 1; }
           mv main_obf.py main.py
 
-          echo "▶ 编译 .so"
+          echo "▶ 生成 setup.py"
           cat > setup.py << 'SETUP_EOF'
           from setuptools import setup
           from Cython.Build import cythonize
@@ -314,45 +338,55 @@ jobs:
           )
           SETUP_EOF
 
+          echo "▶ 编译"
           python setup.py build_ext --inplace
 
           SO=$(ls main.cpython-*.so 2>/dev/null | head -1)
           [ -n "${SO}" ] || { echo "❌ 未找到 .so"; exit 1; }
           echo "生成文件: ${SO}"
 
-          echo "▶ ldd 检查链接"
+          echo "▶ ldd 检查（仅供参考）"
           ldd "${SO}" || true
 
-          # OUTFILE 由宿主机通过 -e 注入
-          mv "${SO}" "/work/output/${OUTFILE}"
-          echo "✅ 已移动到 /work/output/${OUTFILE}"
-          DOCKER_SCRIPT
+          echo "▶ 移动产物到 /output/${OUTFILE}"
+          mv "${SO}" "/output/${OUTFILE}"
+          echo "✅ 编译完成"
+          CONTAINER_SCRIPT
 
-          echo "▶ 产物列表:"
-          ls -lh output/
+          echo "▶ 宿主机产物列表:"
+          ls -lh "${{ github.workspace }}/output/"
 
       - name: 验证 musl .so 导入（Alpine 容器内）
         run: |
           PY_VER="${{ matrix.python-version }}"
           ARCH="${{ matrix.arch }}"
-          SO="main-${PY_VER}-${ARCH}-musl.so"
+          SO_NAME="main-${PY_VER}-${ARCH}-musl.so"
 
           docker run --rm \
-            -v "$PWD/output:/out" \
-            -e "SO=${SO}" \
+            -v "${{ github.workspace }}/output:/out" \
+            -e "SO_NAME=${SO_NAME}" \
             "python:${PY_VER}-alpine" \
             sh << 'VALIDATE_SCRIPT'
           set -e
           apk add --no-cache libstdc++ libgcc --quiet
           pip install --quiet grpcio protobuf pyyaml psutil aiohttp
           cd /out
+
+          # 验证文件存在
+          [ -f "${SO_NAME}" ] || { echo "❌ 文件不存在: ${SO_NAME}"; ls -la; exit 1; }
+          [ -s "${SO_NAME}" ] || { echo "❌ 文件为空: ${SO_NAME}"; exit 1; }
+          echo "文件大小: $(ls -lh ${SO_NAME} | awk '{print $5}')"
+
           python - << 'PYEOF'
-          import importlib.util, os
-          so = os.environ["SO"]
-          spec = importlib.util.spec_from_file_location("main", so)
-          mod  = importlib.util.module_from_spec(spec)
+          import importlib.util, os, sys
+          so = os.environ["SO_NAME"]
+          spec = importlib.util.spec_from_file_location("main", f"/out/{so}")
+          if spec is None:
+              print(f"❌ 无法加载: {so}", file=sys.stderr)
+              sys.exit(1)
+          mod = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(mod)
-          print(f'✅ musl import OK | WorkerApp={hasattr(mod, "WorkerApp")}')
+          print(f"✅ musl import OK | WorkerApp={hasattr(mod, 'WorkerApp')}")
           PYEOF
           VALIDATE_SCRIPT
 
@@ -362,28 +396,48 @@ jobs:
           UPLOAD_URL: ${{ needs.prepare.outputs.upload_url }}
         run: |
           set -euo pipefail
+
           PY_VER="${{ matrix.python-version }}"
           ARCH="${{ matrix.arch }}"
           BASENAME="main-${PY_VER}-${ARCH}-musl.so"
-          FILE="output/${BASENAME}"
+          # 使用绝对路径，避免工作目录歧义
+          FILE="${{ github.workspace }}/output/${BASENAME}"
 
+          # 验证 upload_url
           if [[ -z "${UPLOAD_URL}" || "${UPLOAD_URL}" == "null" ]]; then
             echo "❌ upload_url 无效"
             exit 1
           fi
 
+          # 验证文件存在且非空
+          if [[ ! -s "${FILE}" ]]; then
+            echo "❌ 产物文件不存在或为空: ${FILE}"
+            echo "output 目录内容:"
+            ls -la "${{ github.workspace }}/output/" || true
+            exit 1
+          fi
+
+          echo "▶ 文件信息:"
+          ls -lh "${FILE}"
+
           BASE_URL="${UPLOAD_URL%\{*}"
           echo "▶ 上传 ${BASENAME} ..."
 
-          HTTP_CODE=$(curl -fsSL -o /dev/null -w "%{http_code}" \
+          # 不用 -f，手动检查状态码
+          RESPONSE=$(curl -sS -w "\n%{http_code}" \
             -X POST \
             -H "Authorization: token ${GH_TOKEN}" \
             -H "Content-Type: application/octet-stream" \
             --data-binary @"${FILE}" \
             "${BASE_URL}?name=${BASENAME}")
 
+          HTTP_CODE=$(echo "${RESPONSE}" | tail -n1)
+          BODY=$(echo "${RESPONSE}" | sed '$d')
+
+          echo "HTTP 状态码: ${HTTP_CODE}"
           if [[ "${HTTP_CODE}" != "201" ]]; then
-            echo "❌ 上传失败，HTTP ${HTTP_CODE}"
+            echo "❌ 上传失败"
+            echo "响应内容: ${BODY}"
             exit 1
           fi
           echo "✅ 上传成功 (201)"
