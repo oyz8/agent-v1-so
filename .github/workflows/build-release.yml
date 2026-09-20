@@ -72,10 +72,38 @@ jobs:
           ACTOR="${{ github.actor }}"
           SHA="${{ github.sha }}"
 
+          # 用真实换行符构造 body，再交给 jq 序列化
+          BODY=$(cat << EOF
+          ## main.so 全版本合集
+
+          本 Release 由 GitHub Actions 自动编译，包含 **glibc** 与 **musl** 两套原生扩展。
+
+          ### 文件命名规则
+
+          \`\`\`
+          main-{python}-{arch}.so       # glibc（VPS / Debian / Ubuntu）
+          main-{python}-{arch}-musl.so  # musl（Alpine / Unikraft Cloud）
+          \`\`\`
+
+          ### 架构与 Python 版本
+
+          - **架构**：\`amd64\`、\`arm64\`
+          - **Python**：\`3.8\` ~ \`3.13\`（musl），\`3.8\` ~ \`3.14\`（glibc）
+          - **注意**：musl arm64 不含 py3.8（grpcio 源码编译耗时过长）
+
+          ### 提交信息
+
+          - Commit: \`${SHA}\`
+          - 触发者: @${ACTOR}
+          - 运行编号: #${RUN_NUMBER}
+          EOF
+          )
+
+          # jq -n --arg 会把真实换行符正确序列化为 JSON 的 \n
           PAYLOAD=$(jq -n \
             --arg tag  "${TAG}" \
             --arg name "main.so 全版本合集 | #${RUN_NUMBER}" \
-            --arg body "## main.so 全版本合集\n\n本 Release 由 GitHub Actions 自动编译，包含 **glibc** 与 **musl** 两套原生扩展。\n\n### 文件命名规则\n\n\`\`\`\nmain-{python}-{arch}.so       # glibc（VPS / Debian / Ubuntu）\nmain-{python}-{arch}-musl.so  # musl（Alpine / Unikraft Cloud）\n\`\`\`\n\n### 架构与 Python 版本\n\n- **架构**：\`amd64\`、\`arm64\`\n- **Python**：\`3.8\` ~ \`3.13\`（musl），\`3.8\` ~ \`3.14\`（glibc）\n- **注意**：musl arm64 不含 py3.8（grpcio 源码编译耗时过长）\n\n### 提交信息\n\n- Commit: \`${SHA}\`\n- 触发者: @${ACTOR}\n- 运行编号: #${RUN_NUMBER}" \
+            --arg body "${BODY}" \
             '{tag_name:$tag,name:$name,body:$body,draft:true,prerelease:false}')
 
           echo "▶ 创建 Draft Release (tag=${TAG}) ..."
