@@ -44,7 +44,6 @@ jobs:
             echo "  无已发布 Release，全部清理"
           fi
 
-          echo "▶ 开始分页删除..."
           PAGE=1
           while true; do
             ITEMS=$(gh api "repos/${REPO}/releases?per_page=100&page=${PAGE}" \
@@ -83,7 +82,6 @@ jobs:
             --arg body "## main.so 全版本合集\n\n本 Release 由 GitHub Actions 自动编译，包含 **glibc** 与 **musl** 两套原生扩展。\n\n### 文件命名规则\n\n\`\`\`\nmain-{python}-{arch}.so       # glibc（VPS / Debian / Ubuntu）\nmain-{python}-{arch}-musl.so  # musl（Alpine / Unikraft Cloud）\n\`\`\`\n\n### 提交信息\n\n- Commit: \`${SHA}\`\n- 触发者: @${ACTOR}\n- 运行编号: #${RUN_NUMBER}" \
             '{tag_name:$tag, name:$name, body:$body, draft:true, prerelease:false}')
 
-          echo "▶ 创建 Draft Release (tag=${TAG}) ..."
           RESPONSE=$(gh api \
             --method POST \
             --header "Accept: application/vnd.github.v3+json" \
@@ -204,24 +202,22 @@ jobs:
           GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
           UPLOAD_URL: ${{ needs.prepare.outputs.upload_url }}
           FILENAME:   ${{ steps.artifact.outputs.filename }}
-          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
         run: |
           set -euo pipefail
 
           if [[ -z "${UPLOAD_URL}" || "${UPLOAD_URL}" == "null" ]]; then
-            echo "❌ upload_url 无效: '${UPLOAD_URL}'"
+            echo "❌ upload_url 无效"
             exit 1
           fi
 
           FILE="${{ github.workspace }}/artifact.so"
           if [[ ! -s "${FILE}" ]]; then
-            echo "❌ 产物文件不存在或为空: ${FILE}"
+            echo "❌ 产物文件不存在或为空"
             exit 1
           fi
 
           ls -lh "${FILE}"
           BASE_URL="${UPLOAD_URL%\{*}"
-          echo "▶ 上传 ${FILENAME} ..."
 
           RESPONSE=$(curl -sS -w "\n%{http_code}" \
             -X POST \
@@ -236,8 +232,6 @@ jobs:
 
           if [[ "${HTTP_CODE}" != "201" ]]; then
             echo "❌ 上传失败，响应: ${BODY}"
-            # ── 上传失败：删除本次草稿 Release ──────────────────────────────
-            echo "▶ 删除草稿 Release ID=${RELEASE_ID} ..."
             gh release delete "${{ needs.prepare.outputs.tag }}" \
               --repo "${{ github.repository }}" \
               --yes --cleanup-tag 2>/dev/null || true
@@ -274,23 +268,16 @@ jobs:
           token:      ${{ secrets.REPO_TOKEN }}
           path:       src
 
-      - name: 编译 musl .so（Alpine 容器内）
+      # ── 关键修复：把容器内脚本写成文件再挂载执行 ──────────────────────────
+      - name: 准备容器内编译脚本
         run: |
-          set -euo pipefail
-
-          PY_VER="${{ matrix.python-version }}"
-          ARCH="${{ matrix.arch }}"
-          OUTFILE="main-${PY_VER}-${ARCH}-musl.so"
+          mkdir -p "${{ github.workspace }}/scripts"
           mkdir -p "${{ github.workspace }}/output"
 
-          docker run --rm \
-            -v "${{ github.workspace }}/src/agent-v1-so:/work" \
-            -v "${{ github.workspace }}/output:/output" \
-            -e "OUTFILE=${OUTFILE}" \
-            -w /work \
-            "python:${PY_VER}-alpine" \
-            sh << 'CONTAINER_SCRIPT'
-          set -e
+          # 写入编译脚本文件，规避 heredoc+sh 的 set -e 失效问题
+          cat > "${{ github.workspace }}/scripts/build_musl.sh" << 'SCRIPT'
+          #!/bin/sh
+          set -ex
 
           echo "▶ 安装系统依赖"
           apk add --no-cache \
@@ -329,20 +316,80 @@ jobs:
           SETUP_EOF
 
           echo "▶ 编译"
-          python setup.py build_ext --inplace
+          python setup.py build_ext --inplace 2>&1
 
+          echo "▶ 查找 .so 产物"
           SO=$(ls main.cpython-*.so 2>/dev/null | head -1)
-          [ -n "${SO}" ] || { echo "❌ 未找到 .so"; exit 1; }
+          if [ -z "${SO}" ]; then
+            echo "❌ 未找到 .so，当前目录内容:"
+            ls -la
+            exit 1
+          fi
           echo "生成文件: ${SO}"
 
+          echo "▶ ldd 检查（仅供参考）"
           ldd "${SO}" || true
 
+          echo "▶ 移动产物"
           mv "${SO}" "/output/${OUTFILE}"
           echo "✅ 编译完成: /output/${OUTFILE}"
-          CONTAINER_SCRIPT
+          ls -lh "/output/${OUTFILE}"
+          SCRIPT
 
-          echo "▶ 宿主机产物列表:"
+          chmod +x "${{ github.workspace }}/scripts/build_musl.sh"
+          echo "✅ 编译脚本已生成"
+          cat "${{ github.workspace }}/scripts/build_musl.sh"
+
+      - name: 编译 musl .so（Alpine 容器内）
+        run: |
+          set -euo pipefail
+
+          PY_VER="${{ matrix.python-version }}"
+          ARCH="${{ matrix.arch }}"
+          OUTFILE="main-${PY_VER}-${ARCH}-musl.so"
+
+          echo "▶ 启动 Alpine 容器编译 ${OUTFILE} ..."
+          docker run --rm \
+            -v "${{ github.workspace }}/src/agent-v1-so:/work" \
+            -v "${{ github.workspace }}/output:/output" \
+            -v "${{ github.workspace }}/scripts:/scripts" \
+            -e "OUTFILE=${OUTFILE}" \
+            -w /work \
+            "python:${PY_VER}-alpine" \
+            sh /scripts/build_musl.sh
+
+          echo "▶ 宿主机产物验证:"
           ls -lh "${{ github.workspace }}/output/"
+          [ -s "${{ github.workspace }}/output/${OUTFILE}" ] \
+            || { echo "❌ 产物为空或不存在"; exit 1; }
+
+      # ── 验证脚本同样写成文件 ───────────────────────────────────────────────
+      - name: 准备容器内验证脚本
+        run: |
+          cat > "${{ github.workspace }}/scripts/validate_musl.py" << 'PYEOF'
+          import importlib.util, os, sys
+
+          so = os.environ["SO_NAME"]
+          path = f"/out/{so}"
+
+          if not os.path.exists(path):
+              print(f"❌ 文件不存在: {path}", file=sys.stderr)
+              sys.exit(1)
+
+          if os.path.getsize(path) == 0:
+              print(f"❌ 文件为空: {path}", file=sys.stderr)
+              sys.exit(1)
+
+          spec = importlib.util.spec_from_file_location("main", path)
+          if spec is None:
+              print(f"❌ 无法加载: {path}", file=sys.stderr)
+              sys.exit(1)
+
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          print(f"✅ musl import OK | WorkerApp={hasattr(mod, 'WorkerApp')}")
+          PYEOF
+          echo "✅ 验证脚本已生成"
 
       - name: 验证 musl .so 导入（Alpine 容器内）
         run: |
@@ -352,29 +399,15 @@ jobs:
 
           docker run --rm \
             -v "${{ github.workspace }}/output:/out" \
+            -v "${{ github.workspace }}/scripts:/scripts" \
             -e "SO_NAME=${SO_NAME}" \
             "python:${PY_VER}-alpine" \
-            sh << 'VALIDATE_SCRIPT'
-          set -e
-          apk add --no-cache libstdc++ libgcc --quiet
-          pip install --quiet grpcio protobuf pyyaml psutil aiohttp
-          cd /out
-
-          [ -f "${SO_NAME}" ] || { echo "❌ 文件不存在: ${SO_NAME}"; ls -la; exit 1; }
-          [ -s "${SO_NAME}" ] || { echo "❌ 文件为空: ${SO_NAME}"; exit 1; }
-
-          python - << 'PYEOF'
-          import importlib.util, os, sys
-          so = os.environ["SO_NAME"]
-          spec = importlib.util.spec_from_file_location("main", f"/out/{so}")
-          if spec is None:
-              print(f"❌ 无法加载: {so}", file=sys.stderr)
-              sys.exit(1)
-          mod = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(mod)
-          print(f"✅ musl import OK | WorkerApp={hasattr(mod, 'WorkerApp')}")
-          PYEOF
-          VALIDATE_SCRIPT
+            sh -c '
+              set -e
+              apk add --no-cache libstdc++ libgcc --quiet
+              pip install --quiet grpcio protobuf pyyaml psutil aiohttp
+              python /scripts/validate_musl.py
+            '
 
       - name: 上传 musl .so 到 Draft Release
         env:
@@ -416,8 +449,6 @@ jobs:
 
           if [[ "${HTTP_CODE}" != "201" ]]; then
             echo "❌ 上传失败，响应: ${BODY}"
-            # ── 上传失败：删除本次草稿 Release ──────────────────────────────
-            echo "▶ 删除草稿 Release ID=${{ needs.prepare.outputs.release_id }} ..."
             gh release delete "${{ needs.prepare.outputs.tag }}" \
               --repo "${{ github.repository }}" \
               --yes --cleanup-tag 2>/dev/null || true
@@ -427,38 +458,36 @@ jobs:
           echo "✅ 上传成功 (201)"
 
 # ╔══════════════════════════════════════════════════════════════════════════════
-# ║  JOB 4 · cleanup-on-failure（任意编译 job 失败时删除草稿）
+# ║  JOB 4 · cleanup-on-failure
 # ╚══════════════════════════════════════════════════════════════════════════════
   cleanup-on-failure:
     name: 失败时删除草稿 Release
     needs: [prepare, build, build-musl]
-    # build 或 build-musl 中有任意 job 失败时触发
     if: ${{ failure() }}
     runs-on: ubuntu-latest
 
     steps:
       - name: 删除草稿 Release
         env:
-          GH_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
-          TAG:        ${{ needs.prepare.outputs.tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG:      ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           REPO="${{ github.repository }}"
 
-          if [[ -z "${RELEASE_ID}" || "${RELEASE_ID}" == "null" ]]; then
-            echo "⚠️  无有效 RELEASE_ID，跳过删除"
+          if [[ -z "${TAG}" || "${TAG}" == "null" ]]; then
+            echo "⚠️  无有效 TAG，跳过删除"
             exit 0
           fi
 
-          echo "▶ 检测到编译失败，删除草稿 Release ID=${RELEASE_ID} (tag=${TAG}) ..."
+          echo "▶ 检测到失败，删除草稿 Release (tag=${TAG}) ..."
           gh release delete "${TAG}" \
             --repo "${REPO}" \
             --yes --cleanup-tag 2>/dev/null || true
           echo "✅ 草稿已删除"
 
 # ╔══════════════════════════════════════════════════════════════════════════════
-# ║  JOB 5 · publish（全部成功才发布）
+# ║  JOB 5 · publish
 # ╚══════════════════════════════════════════════════════════════════════════════
   publish:
     name: 正式发布 Release
