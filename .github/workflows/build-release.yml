@@ -14,6 +14,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: 生成统一标签
         id: tag
         run: echo "tag=main.so-v${{ github.run_number }}" >> $GITHUB_OUTPUT
@@ -53,23 +56,39 @@ jobs:
           done
           echo "清理完成！"
 
-      - name: 创建 Draft Release
+      - name: 创建 Draft Release（body 从 RELEASE_NOTES.md 读取）
         id: create_draft
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "向 GitHub API 创建 Draft Release ..."
+          set -e
+
+          # 如果文件不存在，给出兜底内容
+          if [ ! -f RELEASE_NOTES.md ]; then
+            echo "RELEASE_NOTES.md 不存在，使用默认说明"
+            echo "编译中..." > RELEASE_NOTES.md
+          fi
+
+          # jq -Rs . 把多行文本转义成合法的 JSON 字符串
+          NOTES_BODY=$(jq -Rs . < RELEASE_NOTES.md)
+
+          # 用 jq 构造整个请求体，避免手写 JSON 容易漏转义
+          REQ_BODY=$(jq -n \
+            --arg tag   "${{ steps.tag.outputs.tag }}" \
+            --arg name  "main.so 全版本合集 | #${{ github.run_number }}" \
+            --argjson body "$NOTES_BODY" \
+            '{tag_name: $tag, name: $name, body: $body, draft: true, prerelease: false}')
+
+          echo "===== 请求体预览 ====="
+          echo "$REQ_BODY" | jq -r '.body' | head -20
+          echo "======================"
+
           response=$(curl -sS -w "\n%{http_code}" -X POST \
             -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${{ github.repository }}/releases" \
-            -d '{
-              "tag_name": "${{ steps.tag.outputs.tag }}",
-              "name": "main.so 全版本合集 | #${{ github.run_number }}",
-              "body": "编译中，请稍候 ...",
-              "draft": true,
-              "prerelease": false
-            }')
+            -d "$REQ_BODY")
+
           http_code=$(echo "$response" | tail -n1)
           body=$(echo "$response" | sed '$d')
           echo "HTTP 状态码: $http_code"
@@ -78,6 +97,7 @@ jobs:
             echo "$body"
             exit 1
           fi
+
           upload_url=$(echo "$body" | jq -r '.upload_url')
           release_id=$(echo "$body" | jq -r '.id')
           if [ "$upload_url" = "null" ] || [ -z "$upload_url" ]; then
