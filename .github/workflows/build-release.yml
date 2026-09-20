@@ -8,9 +8,7 @@ permissions:
   actions:  write
 
 jobs:
-# ╔══════════════════════════════════════════════════════════════════════════════
-# ║  JOB 1 · prepare
-# ╚══════════════════════════════════════════════════════════════════════════════
+# JOB 1 · prepare
   prepare:
     name: 清理历史 & 创建 Draft Release
     runs-on: ubuntu-latest
@@ -101,9 +99,7 @@ jobs:
           echo "release_id=${RELEASE_ID}" >> "$GITHUB_OUTPUT"
           echo "✅ Draft Release 创建成功 ID=${RELEASE_ID}"
 
-# ╔══════════════════════════════════════════════════════════════════════════════
-# ║  JOB 2 · build（glibc）
-# ╚══════════════════════════════════════════════════════════════════════════════
+# JOB 2 · build（glibc）
   build:
     name: glibc · py${{ matrix.python-version }} · ${{ matrix.arch }}
     needs: prepare
@@ -240,9 +236,7 @@ jobs:
           fi
           echo "✅ 上传成功 (201)"
 
-# ╔══════════════════════════════════════════════════════════════════════════════
-# ║  JOB 3 · build-musl（Alpine 容器）
-# ╚══════════════════════════════════════════════════════════════════════════════
+# JOB 3 · build-musl（Alpine 容器）
   build-musl:
     name: musl · py${{ matrix.python-version }} · ${{ matrix.arch }}
     needs: prepare
@@ -268,28 +262,33 @@ jobs:
           token:      ${{ secrets.REPO_TOKEN }}
           path:       src
 
-      # ── 关键修复：把容器内脚本写成文件再挂载执行 ──────────────────────────
-      - name: 准备容器内编译脚本
+      - name: 准备容器内脚本
         run: |
           mkdir -p "${{ github.workspace }}/scripts"
           mkdir -p "${{ github.workspace }}/output"
 
-          # 写入编译脚本文件，规避 heredoc+sh 的 set -e 失效问题
           cat > "${{ github.workspace }}/scripts/build_musl.sh" << 'SCRIPT'
           #!/bin/sh
           set -ex
 
-          echo "▶ 安装系统依赖"
-          apk add --no-cache \
-            gcc musl-dev python3-dev libffi-dev openssl-dev cargo make
+          echo "===== Python 信息 ====="
+          python --version
+          which python
+          python -c "import sysconfig; print(sysconfig.get_path('include'))"
 
-          echo "▶ 安装 Python 依赖"
+          echo "===== 安装系统工具链（仅 C/C++ 编译器，不装系统 Python）====="
+          apk add --no-cache \
+            gcc g++ musl-dev libffi-dev openssl-dev make
+
+          echo "===== 安装 Python 依赖 ====="
           pip install --upgrade pip --quiet
+          # grpcio 优先用预编译轮子，实在没有才源码编译
           pip install --quiet \
-            cython setuptools wheel python-minifier \
+            cython setuptools wheel python-minifier
+          pip install --quiet --prefer-binary \
             grpcio protobuf pyyaml psutil requests flask aiohttp
 
-          echo "▶ 混淆 main.py"
+          echo "===== 混淆 main.py ====="
           pyminify \
             --remove-literal-statements \
             --remove-asserts \
@@ -298,7 +297,7 @@ jobs:
           [ -s main_obf.py ] || { echo "❌ 混淆产物为空"; exit 1; }
           mv main_obf.py main.py
 
-          echo "▶ 生成 setup.py"
+          echo "===== 生成 setup.py ====="
           cat > setup.py << 'SETUP_EOF'
           from setuptools import setup
           from Cython.Build import cythonize
@@ -315,30 +314,52 @@ jobs:
           )
           SETUP_EOF
 
-          echo "▶ 编译"
+          echo "===== 编译 ====="
           python setup.py build_ext --inplace 2>&1
 
-          echo "▶ 查找 .so 产物"
+          echo "===== 查找产物 ====="
           SO=$(ls main.cpython-*.so 2>/dev/null | head -1)
           if [ -z "${SO}" ]; then
-            echo "❌ 未找到 .so，当前目录内容:"
+            echo "❌ 未找到 .so，当前目录:"
             ls -la
             exit 1
           fi
-          echo "生成文件: ${SO}"
-
-          echo "▶ ldd 检查（仅供参考）"
+          echo "生成: ${SO}"
           ldd "${SO}" || true
 
-          echo "▶ 移动产物"
+          echo "===== 移动产物 ====="
           mv "${SO}" "/output/${OUTFILE}"
-          echo "✅ 编译完成: /output/${OUTFILE}"
           ls -lh "/output/${OUTFILE}"
+          echo "✅ 完成"
           SCRIPT
 
           chmod +x "${{ github.workspace }}/scripts/build_musl.sh"
-          echo "✅ 编译脚本已生成"
-          cat "${{ github.workspace }}/scripts/build_musl.sh"
+
+          # ── 验证脚本 ────────────────────────────────────────────────────────
+          cat > "${{ github.workspace }}/scripts/validate_musl.py" << 'PYEOF'
+          import importlib.util, os, sys
+
+          so = os.environ["SO_NAME"]
+          path = f"/out/{so}"
+
+          if not os.path.exists(path):
+              print(f"❌ 文件不存在: {path}", file=sys.stderr)
+              sys.exit(1)
+          if os.path.getsize(path) == 0:
+              print(f"❌ 文件为空: {path}", file=sys.stderr)
+              sys.exit(1)
+
+          spec = importlib.util.spec_from_file_location("main", path)
+          if spec is None:
+              print(f"❌ 无法加载 spec: {path}", file=sys.stderr)
+              sys.exit(1)
+
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          print(f"✅ musl import OK | WorkerApp={hasattr(mod, 'WorkerApp')}")
+          PYEOF
+
+          echo "✅ 脚本准备完成"
 
       - name: 编译 musl .so（Alpine 容器内）
         run: |
@@ -348,7 +369,7 @@ jobs:
           ARCH="${{ matrix.arch }}"
           OUTFILE="main-${PY_VER}-${ARCH}-musl.so"
 
-          echo "▶ 启动 Alpine 容器编译 ${OUTFILE} ..."
+          echo "▶ 启动容器: python:${PY_VER}-alpine"
           docker run --rm \
             -v "${{ github.workspace }}/src/agent-v1-so:/work" \
             -v "${{ github.workspace }}/output:/output" \
@@ -362,34 +383,7 @@ jobs:
           ls -lh "${{ github.workspace }}/output/"
           [ -s "${{ github.workspace }}/output/${OUTFILE}" ] \
             || { echo "❌ 产物为空或不存在"; exit 1; }
-
-      # ── 验证脚本同样写成文件 ───────────────────────────────────────────────
-      - name: 准备容器内验证脚本
-        run: |
-          cat > "${{ github.workspace }}/scripts/validate_musl.py" << 'PYEOF'
-          import importlib.util, os, sys
-
-          so = os.environ["SO_NAME"]
-          path = f"/out/{so}"
-
-          if not os.path.exists(path):
-              print(f"❌ 文件不存在: {path}", file=sys.stderr)
-              sys.exit(1)
-
-          if os.path.getsize(path) == 0:
-              print(f"❌ 文件为空: {path}", file=sys.stderr)
-              sys.exit(1)
-
-          spec = importlib.util.spec_from_file_location("main", path)
-          if spec is None:
-              print(f"❌ 无法加载: {path}", file=sys.stderr)
-              sys.exit(1)
-
-          mod = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(mod)
-          print(f"✅ musl import OK | WorkerApp={hasattr(mod, 'WorkerApp')}")
-          PYEOF
-          echo "✅ 验证脚本已生成"
+          echo "✅ 产物确认"
 
       - name: 验证 musl .so 导入（Alpine 容器内）
         run: |
@@ -404,8 +398,10 @@ jobs:
             "python:${PY_VER}-alpine" \
             sh -c '
               set -e
+              # 同样只装运行时库，不装系统 python3
               apk add --no-cache libstdc++ libgcc --quiet
-              pip install --quiet grpcio protobuf pyyaml psutil aiohttp
+              pip install --quiet --prefer-binary \
+                grpcio protobuf pyyaml psutil aiohttp
               python /scripts/validate_musl.py
             '
 
@@ -457,9 +453,8 @@ jobs:
           fi
           echo "✅ 上传成功 (201)"
 
-# ╔══════════════════════════════════════════════════════════════════════════════
-# ║  JOB 4 · cleanup-on-failure
-# ╚══════════════════════════════════════════════════════════════════════════════
+
+# JOB 4 · cleanup-on-failure
   cleanup-on-failure:
     name: 失败时删除草稿 Release
     needs: [prepare, build, build-musl]
@@ -486,9 +481,7 @@ jobs:
             --yes --cleanup-tag 2>/dev/null || true
           echo "✅ 草稿已删除"
 
-# ╔══════════════════════════════════════════════════════════════════════════════
-# ║  JOB 5 · publish
-# ╚══════════════════════════════════════════════════════════════════════════════
+# JOB 5 · publish
   publish:
     name: 正式发布 Release
     needs: [prepare, build, build-musl]
